@@ -236,7 +236,7 @@ func (k *kubeManager) probeConnectivity(args *probeConnectivityArgs) (bool, stri
 
 // executeRemoteCommand executes a remote shell command on the given pod.
 func (k *kubeManager) executeRemoteCommand(namespace string, pod string, command []string) (string, string, error) {
-	return e2epod.ExecWithOptions(k.framework, e2epod.ExecOptions{
+	return e2epod.Exec(k.framework.TContext(context.Background()), e2epod.ExecOptions{
 		Command:            command,
 		Namespace:          namespace,
 		PodName:            pod,
@@ -321,13 +321,15 @@ func (k *kubeManager) getNamespace(ctx context.Context, ns string) (*v1.Namespac
 	return selectedNameSpace, nil
 }
 
-// getProbeTimeoutSeconds returns a timeout for how long the probe should work before failing a check, and takes windows heuristics into account, where requests can take longer sometimes.
+// getProbeTimeoutSeconds returns a timeout for how long the probe should work before failing a
+// check. The 3-second timeout not only ensures probe reliability across different platforms,
+// but also serves as an assertion on the non-functional requirement that the dataplane must
+// program network policies within an acceptable latency. This is especially critical for
+// network policy features where slow dataplane programming could impact connectivity and security.
+// The 3-second threshold was determined through empirical evidence as the maximum acceptable
+// latency for network policy enforcement.
 func getProbeTimeoutSeconds() int {
-	timeoutSeconds := 1
-	if framework.NodeOSDistroIs("windows") {
-		timeoutSeconds = 3
-	}
-	return timeoutSeconds
+	return 3
 }
 
 // getWorkers returns the number of workers suggested to run when testing.

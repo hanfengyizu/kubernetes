@@ -139,36 +139,36 @@ func NewController(
 	}
 
 	logger := klog.FromContext(ctx)
-	_, err = podInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+	_, err = podInformer.Informer().AddEventHandlerWithOptions(cache.ResourceEventHandlerFuncs{
 		AddFunc:    func(obj interface{}) { c.enqueuePod(logger, obj) },
 		UpdateFunc: func(oldObj, newObj interface{}) { c.updatePod(logger, oldObj, newObj) },
 		DeleteFunc: func(obj interface{}) { c.enqueuePod(logger, obj) },
-	})
+	}, cache.HandlerOptions{Logger: &logger})
 	if err != nil {
 		return nil, err
 	}
 
-	_, err = pvcInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+	_, err = pvcInformer.Informer().AddEventHandlerWithOptions(cache.ResourceEventHandlerFuncs{
 		AddFunc:    func(obj interface{}) { c.addPVC(logger, obj) },
 		UpdateFunc: func(oldObj, newObj interface{}) { c.updatePVC(logger, oldObj, newObj) },
-	})
+	}, cache.HandlerOptions{Logger: &logger})
 	if err != nil {
 		return nil, err
 	}
 
-	_, err = pvInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+	_, err = pvInformer.Informer().AddEventHandlerWithOptions(cache.ResourceEventHandlerFuncs{
 		AddFunc:    func(obj interface{}) { c.addPV(logger, obj) },
 		UpdateFunc: func(oldObj, newObj interface{}) { c.updatePV(logger, oldObj, newObj) },
-	})
+	}, cache.HandlerOptions{Logger: &logger})
 	if err != nil {
 		return nil, err
 	}
 
-	_, err = csiDriverInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+	_, err = csiDriverInformer.Informer().AddEventHandlerWithOptions(cache.ResourceEventHandlerFuncs{
 		AddFunc:    func(obj interface{}) { c.addCSIDriver(logger, obj) },
 		UpdateFunc: func(oldObj, newObj interface{}) { c.updateCSIDriver(logger, oldObj, newObj) },
 		DeleteFunc: func(obj interface{}) { c.deleteCSIDriver(logger, obj) },
-	})
+	}, cache.HandlerOptions{Logger: &logger})
 	if err != nil {
 		return nil, err
 	}
@@ -472,7 +472,7 @@ func (c *Controller) syncPod(ctx context.Context, pod *v1.Pod) error {
 			if volumeutil.IsMultipleSELinuxLabelsError(err) {
 				c.eventRecorder.Eventf(pod, v1.EventTypeWarning, "MultipleSELinuxLabels", "Volume %q is mounted twice with different SELinux labels inside this pod", mount)
 			}
-			logger.V(4).Error(err, "failed to get SELinux label", "pod", klog.KObj(pod), "volume", mount)
+			logger.V(4).Info("failed to get SELinux label", "pod", klog.KObj(pod), "volume", mount, "err", err)
 			errs = append(errs, err)
 			continue
 		}
@@ -535,7 +535,7 @@ func (c *Controller) reportConflictEvents(logger klog.Logger, conflicts []volume
 	for _, conflict := range conflicts {
 		pod, err := c.podLister.Pods(conflict.Pod.Namespace).Get(conflict.Pod.Name)
 		if err != nil {
-			logger.V(2).Error(err, "failed to get first pod for event", "pod", conflict.Pod)
+			logger.V(2).Info("failed to get first pod for event", "pod", conflict.Pod, "err", err)
 			// It does not make sense to report a conflict that has been resolved by deleting one of the pods.
 			return
 		}

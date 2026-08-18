@@ -38,7 +38,7 @@ import (
 	cgotesting "k8s.io/client-go/testing"
 	drapb "k8s.io/kubelet/pkg/apis/dra/v1beta1"
 	timedworkers "k8s.io/kubernetes/pkg/controller/tainteviction"
-	"k8s.io/kubernetes/test/utils/ktesting"
+	"k8s.io/kubernetes/test/utils/client-go/ktesting"
 	"k8s.io/utils/ptr"
 )
 
@@ -105,7 +105,7 @@ func getFakeClient(t *testing.T, nodeName, driverName string, slice *resourceapi
 
 func requireNoSlices(tCtx ktesting.TContext) {
 	tCtx.Helper()
-	ktesting.Eventually(tCtx, func(tCtx ktesting.TContext) error {
+	tCtx.Eventually(func(tCtx ktesting.TContext) error {
 		slices, err := tCtx.Client().ResourceV1().ResourceSlices().List(tCtx, metav1.ListOptions{})
 		if err != nil {
 			return err
@@ -218,7 +218,7 @@ func TestRegistrationHandler(t *testing.T) {
 			if test.withClient {
 				fakeClient := getFakeClient(t, nodeName, test.driverName, getSlice("test-slice"))
 				client = fakeClient
-				tCtx = ktesting.WithClients(tCtx, nil, nil, client, nil, nil)
+				tCtx = tCtx.WithClients(nil, nil, client, nil, nil)
 			}
 
 			// The DRAPluginManager wipes all slices at startup.
@@ -229,14 +229,14 @@ func TestRegistrationHandler(t *testing.T) {
 			}
 
 			// Simulate one existing plugin A.
-			err = draPlugins.RegisterPlugin(pluginA, endpointA, []string{drapb.DRAPluginService}, nil)
+			err = draPlugins.RegisterPlugin(tCtx, pluginA, endpointA, []string{drapb.DRAPluginService}, nil)
 			require.NoError(t, err)
 			t.Cleanup(func() {
 				tCtx.Logf("Removing plugin %s", pluginA)
-				draPlugins.DeRegisterPlugin(pluginA, endpointA)
+				draPlugins.DeRegisterPlugin(tCtx, pluginA, endpointA)
 			})
 
-			err = draPlugins.ValidatePlugin(test.driverName, endpoint, test.supportedServices)
+			err = draPlugins.ValidatePlugin(tCtx, test.driverName, endpoint, test.supportedServices)
 			if test.shouldError {
 				require.Error(t, err)
 			} else {
@@ -250,7 +250,7 @@ func TestRegistrationHandler(t *testing.T) {
 			}
 
 			// Add plugin for the first time.
-			err = draPlugins.RegisterPlugin(test.driverName, endpoint, test.supportedServices, nil)
+			err = draPlugins.RegisterPlugin(tCtx, test.driverName, endpoint, test.supportedServices, nil)
 			if test.shouldError {
 				require.Error(t, err)
 			} else {
@@ -266,9 +266,9 @@ func TestRegistrationHandler(t *testing.T) {
 				}
 
 				tCtx.Logf("Removing plugin %s", test.driverName)
-				draPlugins.DeRegisterPlugin(test.driverName, endpoint)
+				draPlugins.DeRegisterPlugin(tCtx, test.driverName, endpoint)
 				// Nop.
-				draPlugins.DeRegisterPlugin(test.driverName, endpoint)
+				draPlugins.DeRegisterPlugin(tCtx, test.driverName, endpoint)
 				if test.withClient {
 					requireNoSlices(tCtx)
 				}
@@ -307,7 +307,7 @@ func TestConnectionHandling(t *testing.T) {
 
 			slice := getSlice(sliceName)
 			client := getFakeClient(t, nodeName, driverName, slice)
-			tCtx = ktesting.WithClients(tCtx, nil, nil, client, nil, nil)
+			tCtx = tCtx.WithClients(nil, nil, client, nil, nil)
 
 			// The handler wipes all slices at startup.
 			draPlugins := NewDRAPluginManager(tCtx, client, getFakeNode, &mockStreamHandler{}, test.delay)
@@ -320,7 +320,7 @@ func TestConnectionHandling(t *testing.T) {
 			require.NoError(t, err)
 			defer teardown()
 
-			err = draPlugins.RegisterPlugin(driverName, endpoint, []string{service}, nil)
+			err = draPlugins.RegisterPlugin(tCtx, driverName, endpoint, []string{service}, nil)
 			require.NoError(t, err)
 
 			plugin := draPlugins.get(driverName)

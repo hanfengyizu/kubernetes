@@ -49,8 +49,8 @@ import (
 	storageframework "k8s.io/kubernetes/test/e2e/storage/framework"
 	"k8s.io/kubernetes/test/e2e/storage/testsuites"
 	"k8s.io/kubernetes/test/e2e/storage/utils"
-	"k8s.io/kubernetes/test/utils/format"
 	imageutils "k8s.io/kubernetes/test/utils/image"
+	"k8s.io/kubernetes/test/utils/ktesting/format"
 	"k8s.io/utils/ptr"
 )
 
@@ -104,6 +104,7 @@ type testParameters struct {
 	enableSnapshot               bool
 	enableVolumeMountGroup       bool // enable the VOLUME_MOUNT_GROUP node capability in the CSI mock driver.
 	enableNodeVolumeCondition    bool
+	enableNodeStorageHealth      bool
 	hooks                        *drivers.Hooks
 	tokenRequests                []storagev1.TokenRequest
 	serviceAccountTokenInSecrets *bool // if true, the service account token should be passed only via secrets
@@ -178,6 +179,7 @@ func (m *mockDriverSetup) init(ctx context.Context, tp testParameters) {
 		EnableResizing:               tp.enableResizing,
 		EnableNodeExpansion:          tp.enableNodeExpansion,
 		EnableNodeVolumeCondition:    tp.enableNodeVolumeCondition,
+		EnableNodeStorageHealth:      tp.enableNodeStorageHealth,
 		DisableControllerExpansion:   tp.disableControllerExpansion,
 		EnableSnapshot:               tp.enableSnapshot,
 		EnableVolumeMountGroup:       tp.enableVolumeMountGroup,
@@ -1086,13 +1088,13 @@ func createFSGroupRequestPreHook(nodeStageFsGroup, nodePublishFsGroup *string) *
 
 // createPreHook counts invocations of a certain method (identified by a substring in the full gRPC method name).
 func createPreHook(method string, callback func(counter int64) error) *drivers.Hooks {
-	var counter int64
+	var counter atomic.Int64
 
 	return &drivers.Hooks{
 		Pre: func() func(ctx context.Context, fullMethod string, request interface{}) (reply interface{}, err error) {
 			return func(ctx context.Context, fullMethod string, request interface{}) (reply interface{}, err error) {
 				if strings.Contains(fullMethod, method) {
-					counter := atomic.AddInt64(&counter, 1)
+					counter := counter.Add(1)
 					return nil, callback(counter)
 				}
 				return nil, nil

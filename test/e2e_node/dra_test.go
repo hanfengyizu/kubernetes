@@ -64,6 +64,8 @@ import (
 
 	"k8s.io/dynamic-resource-allocation/kubeletplugin"
 	"k8s.io/dynamic-resource-allocation/resourceslice"
+	drahealthv1 "k8s.io/kubelet/pkg/apis/dra-health/v1"
+	drahealthv1alpha1 "k8s.io/kubelet/pkg/apis/dra-health/v1alpha1"
 	testdriver "k8s.io/kubernetes/test/e2e/dra/test-driver/app"
 	testdrivergomega "k8s.io/kubernetes/test/e2e/dra/test-driver/gomega"
 )
@@ -896,16 +898,22 @@ var _ = framework.SIGDescribe("node")(framework.WithLabel("DRA"), feature.Dynami
 
 	f.Context("Resource Health", framework.WithFeatureGate(features.ResourceHealthStatus), f.WithSerial(), func() {
 
-		// Verifies that device health transitions (Healthy -> Unhealthy -> Healthy)
-		// reported by a DRA plugin are correctly reflected in the Pod's status.
-		ginkgo.It("should reflect device health changes in the Pod's status", func(ctx context.Context) {
+		// testHealthTransitions verifies that device health transitions
+		// (Healthy -> Unhealthy -> Healthy) reported by a DRA plugin are
+		// correctly reflected in the Pod's status, and that the kubelet
+		// consumed them through the expected DRAResourceHealth gRPC API
+		// version.
+		testHealthTransitions := func(ctx context.Context, prefix string, expectedHealthMethod string, opts ...pluginOption) {
 			ginkgo.By("Starting the test driver with channel-based control")
-			kubeletPlugin := newKubeletPlugin(ctx, f.ClientSet, f.Namespace.Name, getNodeName(ctx, f), driverName)
+			kubeletPlugin := newKubeletPlugin(ctx, f.ClientSet, f.Namespace.Name, getNodeName(ctx, f), driverName, opts...)
 
 			pod, claimName, poolNameForTest, deviceNameForTest := setupAndVerifyHealthyPod(
 				ctx, f, kubeletPlugin, driverName,
-				"health-test-class", "health-test-claim", "health-test-pod", "pool-a", "dev-0",
+				prefix+"-class", prefix+"-claim", prefix+"-pod", "pool-a", "dev-0",
 			)
+
+			ginkgo.By("Verifying the negotiated health API version")
+			gomega.Expect(kubeletPlugin.GetGRPCCalls()).To(gomega.ContainElement(gomega.HaveField("FullMethod", expectedHealthMethod)), "expected health stream on %s", expectedHealthMethod)
 
 			ginkgo.By("Setting device health to Unhealthy via control channel")
 			kubeletPlugin.HealthControlChan <- testdriver.DeviceHealthUpdate{
@@ -930,6 +938,23 @@ var _ = framework.SIGDescribe("node")(framework.WithLabel("DRA"), feature.Dynami
 			gomega.Eventually(ctx, func(ctx context.Context) (string, error) {
 				return getDeviceHealthFromAPIServer(f, pod.Namespace, pod.Name, driverName, claimName, poolNameForTest, deviceNameForTest)
 			}).WithTimeout(60*time.Second).WithPolling(2*time.Second).Should(gomega.Equal("Healthy"), "Device health should recover and update to Healthy")
+		}
+
+		ginkgo.It("should reflect device health changes in the Pod's status", func(ctx context.Context) {
+			// The kubelet picks the most recent version when the plugin
+			// serves several, which is the default.
+			testHealthTransitions(ctx, "health-test", nodeWatchResourcesV1Method)
+		})
+
+		ginkgo.It("should reflect device health changes for a plugin which only supports the v1alpha1 health API", func(ctx context.Context) {
+			// Like a driver which shipped before the v1 API existed.
+			// TODO(harche): remove in 1.40 together with the kubelet's
+			// v1alpha1 client support.
+			testHealthTransitions(ctx, "health-v1alpha1", nodeWatchResourcesV1Alpha1Method, withoutHealthV1())
+		})
+
+		ginkgo.It("should reflect device health changes for a plugin which only supports the v1 health API", func(ctx context.Context) {
+			testHealthTransitions(ctx, "health-v1", nodeWatchResourcesV1Method, withoutHealthV1alpha1())
 		})
 
 		// This test verifies that the Kubelet establishes only a single gRPC connection
@@ -1074,7 +1099,7 @@ var _ = framework.SIGDescribe("node")(framework.WithLabel("DRA"), feature.Dynami
 			deviceNames := make([]string, numPods)
 
 			ginkgo.By(fmt.Sprintf("Creating %d pods concurrently to stress test connection management", numPods))
-			for i := 0; i < numPods; i++ {
+			for i := range numPods {
 				className := fmt.Sprintf("concurrent-class-%d", i)
 				claimNames[i] = fmt.Sprintf("concurrent-claim-%d", i)
 				podName := fmt.Sprintf("concurrent-pod-%d", i)
@@ -1097,7 +1122,7 @@ var _ = framework.SIGDescribe("node")(framework.WithLabel("DRA"), feature.Dynami
 				"NodePrepareResources should be called at least once per pod")
 
 			ginkgo.By("Sending health updates for all devices concurrently")
-			for i := 0; i < numPods; i++ {
+			for i := range numPods {
 				kubeletPlugin.HealthControlChan <- testdriver.DeviceHealthUpdate{
 					PoolName:   poolNames[i],
 					DeviceName: deviceNames[i],
@@ -1106,7 +1131,7 @@ var _ = framework.SIGDescribe("node")(framework.WithLabel("DRA"), feature.Dynami
 			}
 
 			ginkgo.By("Verifying all health updates are correctly reflected")
-			for i := 0; i < numPods; i++ {
+			for i := range numPods {
 				pod := pods[i]
 				poolName := poolNames[i]
 				deviceName := deviceNames[i]
@@ -1119,7 +1144,7 @@ var _ = framework.SIGDescribe("node")(framework.WithLabel("DRA"), feature.Dynami
 			}
 
 			ginkgo.By("Changing health status for all devices to verify continued operation")
-			for i := 0; i < numPods; i++ {
+			for i := range numPods {
 				kubeletPlugin.HealthControlChan <- testdriver.DeviceHealthUpdate{
 					PoolName:   poolNames[i],
 					DeviceName: deviceNames[i],
@@ -1128,7 +1153,7 @@ var _ = framework.SIGDescribe("node")(framework.WithLabel("DRA"), feature.Dynami
 			}
 
 			ginkgo.By("Verifying all health changes are correctly reflected")
-			for i := 0; i < numPods; i++ {
+			for i := range numPods {
 				pod := pods[i]
 				poolName := poolNames[i]
 				deviceName := deviceNames[i]
@@ -1187,6 +1212,80 @@ var _ = framework.SIGDescribe("node")(framework.WithLabel("DRA"), feature.Dynami
 				}
 				return fmt.Errorf("could not find container 'testcontainer' in pod status")
 			}).WithContext(ctx).WithTimeout(30*time.Second).WithPolling(2*time.Second).Should(gomega.Succeed(), "The allocatedResourcesStatus field should be absent when the feature gate is disabled")
+		})
+
+		// These tests validate that health status reporting works correctly for devices
+		// allocated with ShareID, ensuring both features integrate properly.
+		f.Context("Resource Health with ShareID", framework.WithFeatureGate(features.ResourceHealthStatus), framework.WithFeatureGate(features.DRAConsumableCapacity), f.WithSerial(), func() {
+
+			ginkgo.BeforeEach(func() {
+				// Skip if feature gates are already enabled (we need to enable them ourselves)
+				if e2eskipper.IsFeatureGateEnabled(features.ResourceHealthStatus) {
+					e2eskipper.Skipf("feature %s is already enabled", features.ResourceHealthStatus)
+				}
+				if e2eskipper.IsFeatureGateEnabled(features.DRAConsumableCapacity) {
+					e2eskipper.Skipf("feature %s is already enabled", features.DRAConsumableCapacity)
+				}
+			})
+
+			// Verifies that device health transitions are correctly reflected in Pod status
+			// for devices allocated with ShareID.
+			ginkgo.It("should reflect device health changes for devices with ShareID", func(ctx context.Context) {
+				ginkgo.By("Starting the test driver")
+				kubeletPlugin := newKubeletPlugin(ctx, f.ClientSet, f.Namespace.Name, getNodeName(ctx, f), driverName)
+
+				ginkgo.By("wait for registration to complete")
+				gomega.Eventually(kubeletPlugin.GetGRPCCalls).WithTimeout(pluginRegistrationTimeout).Should(testdrivergomega.BeRegistered)
+
+				poolName := "shareid-health-pool"
+				deviceName := "shareid-health-device"
+				testShareID := uuid.NewUUID()
+
+				// Create test objects with ShareID in the allocation result
+				pod := createTestObjectsWithShareID(ctx, f, driverName, "shareid-health-class", "shareid-health-claim", "shareid-health-pod", poolName, deviceName, &testShareID)
+
+				ginkgo.By("wait for NodePrepareResources call to succeed")
+				gomega.Eventually(kubeletPlugin.GetGRPCCalls).WithTimeout(retryTestTimeout).Should(testdrivergomega.NodePrepareResourcesSucceeded)
+
+				ginkgo.By("wait for pod to be running")
+				framework.ExpectNoError(e2epod.WaitForPodRunningInNamespace(ctx, f.ClientSet, pod))
+
+				ginkgo.By("Setting device health to Healthy via control channel")
+				kubeletPlugin.HealthControlChan <- testdriver.DeviceHealthUpdate{
+					PoolName:   poolName,
+					DeviceName: deviceName,
+					Health:     "Healthy",
+				}
+
+				ginkgo.By("Verifying device health is Healthy in the pod status")
+				gomega.Eventually(ctx, func(ctx context.Context) (string, error) {
+					return getDeviceHealthFromAPIServer(f, pod.Namespace, pod.Name, driverName, "shareid-health-claim", poolName, deviceName)
+				}).WithTimeout(60*time.Second).WithPolling(2*time.Second).Should(gomega.Equal("Healthy"), "Device with ShareID should show Healthy status")
+
+				ginkgo.By("Setting device health to Unhealthy via control channel")
+				kubeletPlugin.HealthControlChan <- testdriver.DeviceHealthUpdate{
+					PoolName:   poolName,
+					DeviceName: deviceName,
+					Health:     "Unhealthy",
+				}
+
+				ginkgo.By("Verifying device health is now Unhealthy in the pod status")
+				gomega.Eventually(ctx, func(ctx context.Context) (string, error) {
+					return getDeviceHealthFromAPIServer(f, pod.Namespace, pod.Name, driverName, "shareid-health-claim", poolName, deviceName)
+				}).WithTimeout(60*time.Second).WithPolling(2*time.Second).Should(gomega.Equal("Unhealthy"), "Device with ShareID should update to Unhealthy")
+
+				ginkgo.By("Setting device health back to Healthy")
+				kubeletPlugin.HealthControlChan <- testdriver.DeviceHealthUpdate{
+					PoolName:   poolName,
+					DeviceName: deviceName,
+					Health:     "Healthy",
+				}
+
+				ginkgo.By("Verifying device health has recovered to Healthy")
+				gomega.Eventually(ctx, func(ctx context.Context) (string, error) {
+					return getDeviceHealthFromAPIServer(f, pod.Namespace, pod.Name, driverName, "shareid-health-claim", poolName, deviceName)
+				}).WithTimeout(60*time.Second).WithPolling(2*time.Second).Should(gomega.Equal("Healthy"), "Device with ShareID should recover to Healthy")
+			})
 		})
 
 		f.Context("Device ShareID", framework.WithFeatureGate(features.DRAConsumableCapacity), f.WithSerial(), func() {
@@ -1268,6 +1367,30 @@ func withHealthService(enabled bool) pluginOption {
 	}
 }
 
+// withoutHealthV1 restricts the driver to the v1alpha1 DRAResourceHealth
+// gRPC API, like a driver which shipped before the v1 API existed. The
+// kubelet keeps consuming v1alpha1 for three releases of transition.
+func withoutHealthV1() pluginOption {
+	return func(o *testdriver.Options) {
+		o.DisableHealthV1 = true
+	}
+}
+
+// withoutHealthV1alpha1 restricts the driver to the v1 DRAResourceHealth
+// gRPC API, like a driver which has dropped v1alpha1 support.
+func withoutHealthV1alpha1() pluginOption {
+	return func(o *testdriver.Options) {
+		o.DisableHealthV1alpha1 = true
+	}
+}
+
+// The gRPC methods on which the kubelet subscribes to device health updates,
+// depending on the negotiated DRAResourceHealth API version.
+const (
+	nodeWatchResourcesV1Alpha1Method = "/" + drahealthv1alpha1.DRAResourceHealthService + "/NodeWatchResources"
+	nodeWatchResourcesV1Method       = "/" + drahealthv1.DRAResourceHealthService + "/NodeWatchResources"
+)
+
 // Run Kubelet plugin and wait until it's registered
 func newKubeletPlugin(ctx context.Context, clientSet kubernetes.Interface, testNamespace string, nodeName, driverName string, options ...pluginOption) *testdriver.ExamplePlugin {
 	ginkgo.By("start Kubelet plugin")
@@ -1329,7 +1452,10 @@ func newRegistrar(ctx context.Context, clientSet kubernetes.Interface, nodeName,
 	ctx = klog.NewContext(ctx, logger)
 
 	allOpts := []any{
-		testdriver.Options{EnableHealthService: false},
+		// In split deployments the registrar's registration is what the
+		// kubelet negotiates the health service from, so it must advertise
+		// health even though a separate service instance serves it.
+		testdriver.Options{EnableHealthService: true},
 		kubeletplugin.DRAService(false),
 	}
 
@@ -1837,6 +1963,122 @@ func setupAndVerifyHealthyPod(
 	}).WithTimeout(30*time.Second).WithPolling(1*time.Second).Should(gomega.Equal("Healthy"), "Device health should be Healthy after explicit update")
 
 	return pod, claimName, poolName, deviceName
+}
+
+// createTestObjectsWithShareID creates test objects (DeviceClass, ResourceClaim, Pod) for testing
+// ShareID with health status integration. The ShareID is included in the device allocation result.
+func createTestObjectsWithShareID(ctx context.Context, f *framework.Framework, driverName, className, claimName, podName, poolName, deviceName string, shareID *apitypes.UID) *v1.Pod {
+	ginkgo.By(fmt.Sprintf("Creating DeviceClass %q", className))
+	dc := &resourceapi.DeviceClass{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: className,
+		},
+	}
+	_, err := f.ClientSet.ResourceV1().DeviceClasses().Create(ctx, dc, metav1.CreateOptions{})
+	framework.ExpectNoError(err, "failed to create DeviceClass "+className)
+	ginkgo.DeferCleanup(func(ctx context.Context) {
+		err := f.ClientSet.ResourceV1().DeviceClasses().Delete(ctx, className, metav1.DeleteOptions{})
+		if err != nil && !apierrors.IsNotFound(err) {
+			framework.Failf("Failed to delete DeviceClass %s: %v", className, err)
+		}
+	})
+
+	ginkgo.By(fmt.Sprintf("Creating ResourceClaim %q", claimName))
+	claim := &resourceapi.ResourceClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: claimName,
+		},
+		Spec: resourceapi.ResourceClaimSpec{
+			Devices: resourceapi.DeviceClaim{
+				Requests: []resourceapi.DeviceRequest{{
+					Name: "my-request",
+					Exactly: &resourceapi.ExactDeviceRequest{
+						DeviceClassName: className,
+					},
+				}},
+			},
+		},
+	}
+
+	_, err = f.ClientSet.ResourceV1().ResourceClaims(f.Namespace.Name).Create(ctx, claim, metav1.CreateOptions{})
+	framework.ExpectNoError(err, "failed to create ResourceClaim "+claimName)
+	ginkgo.DeferCleanup(func(ctx context.Context) {
+		err := f.ClientSet.ResourceV1().ResourceClaims(f.Namespace.Name).Delete(ctx, claimName, metav1.DeleteOptions{})
+		if err != nil && !apierrors.IsNotFound(err) {
+			framework.Failf("Failed to delete ResourceClaim %s: %v", claimName, err)
+		}
+	})
+
+	ginkgo.By(fmt.Sprintf("Creating long-running Pod %q", podName))
+	pod := &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      podName,
+			Namespace: f.Namespace.Name,
+		},
+		Spec: v1.PodSpec{
+			NodeName:      getNodeName(ctx, f),
+			RestartPolicy: v1.RestartPolicyNever,
+			ResourceClaims: []v1.PodResourceClaim{
+				{Name: claimName, ResourceClaimName: &claimName},
+			},
+			Containers: []v1.Container{
+				{
+					Name:    "testcontainer",
+					Image:   e2epod.GetDefaultTestImage(),
+					Command: []string{"/bin/sh", "-c", "sleep 600"},
+					Resources: v1.ResourceRequirements{
+						Claims: []v1.ResourceClaim{{Name: claimName, Request: "my-request"}},
+					},
+				},
+			},
+		},
+	}
+
+	createdPod, err := f.ClientSet.CoreV1().Pods(f.Namespace.Name).Create(ctx, pod, metav1.CreateOptions{})
+	framework.ExpectNoError(err, "failed to create Pod "+podName)
+	ginkgo.DeferCleanup(func(ctx context.Context) {
+		e2epod.DeletePodOrFail(ctx, f.ClientSet, createdPod.Namespace, createdPod.Name)
+	})
+
+	// Patch the Pod's status to include the ResourceClaimStatuses
+	patch, err := json.Marshal(v1.Pod{
+		Status: v1.PodStatus{
+			ResourceClaimStatuses: []v1.PodResourceClaimStatus{
+				{Name: claimName, ResourceClaimName: &claimName},
+			},
+		},
+	})
+	framework.ExpectNoError(err, "failed to marshal patch for Pod status")
+	_, err = f.ClientSet.CoreV1().Pods(f.Namespace.Name).Patch(ctx, createdPod.Name, apitypes.StrategicMergePatchType, patch, metav1.PatchOptions{}, "status")
+	framework.ExpectNoError(err, "failed to patch Pod status with ResourceClaimStatuses")
+
+	ginkgo.By(fmt.Sprintf("Allocating claim %q with ShareID", claimName))
+	claimToUpdate, err := f.ClientSet.ResourceV1().ResourceClaims(f.Namespace.Name).Get(ctx, claimName, metav1.GetOptions{})
+	framework.ExpectNoError(err, "failed to get latest version of ResourceClaim "+claimName)
+
+	// Update the claims status with ShareID in the allocation result
+	claimToUpdate.Status = resourceapi.ResourceClaimStatus{
+		ReservedFor: []resourceapi.ResourceClaimConsumerReference{
+			{Resource: "pods", Name: createdPod.Name, UID: createdPod.UID},
+		},
+		Allocation: &resourceapi.AllocationResult{
+			Devices: resourceapi.DeviceAllocationResult{
+				Results: []resourceapi.DeviceRequestAllocationResult{
+					{
+						Driver:  driverName,
+						Pool:    poolName,
+						Device:  deviceName,
+						Request: "my-request",
+						ShareID: shareID, // Include ShareID in allocation
+					},
+				},
+			},
+		},
+	}
+	_, err = f.ClientSet.ResourceV1().ResourceClaims(f.Namespace.Name).UpdateStatus(ctx, claimToUpdate, metav1.UpdateOptions{})
+	framework.ExpectNoError(err, "failed to update ResourceClaim status with ShareID")
+
+	return createdPod
 }
 
 // errorOnCloseListener is a mock net.Listener that blocks on Accept()

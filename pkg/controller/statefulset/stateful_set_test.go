@@ -719,12 +719,14 @@ func TestOrphanedPodsWithPVCDeletePolicy(t *testing.T) {
 			om.podsIndexer.Add(pod)
 			claims := getPersistentVolumeClaims(set, pod)
 			for _, claim := range claims {
-				om.CreateClaim(&claim)
+				if err := om.CreateClaim(&claim, set); err != nil {
+					t.Errorf("Failed to create claim %s: %v", claim.Name, err)
+				}
 			}
 		}
 
 		for i := range pods {
-			if _, err := om.setPodReadyCondition(set, i, true); err != nil {
+			if _, err := om.setPodReadyCondition(set, i, true, time.Now()); err != nil {
 				t.Errorf("%d: %v", i, err)
 			}
 			if _, err := om.setPodRunning(set, i); err != nil {
@@ -911,11 +913,11 @@ func TestStaleOwnerRefOnScaleup(t *testing.T) {
 }
 
 func TestStatefulSetAvailabilityCheck(t *testing.T) {
-	_, ctx := ktesting.NewTestContext(t)
+	tCtx := ktesting.Init(t)
 
 	set := setMinReadySeconds(newStatefulSet(4), int32(5)) // 5 seconds
 	set = setupPodManagementPolicy(apps.ParallelPodManagement, set)
-	ssc, _, om, _ := newFakeStatefulSetController(ctx, set)
+	ssc, _, om, _ := newFakeStatefulSetController(tCtx, set)
 	if err := om.setsIndexer.Add(set); err != nil {
 		t.Fatalf("could not add set to the cache: %v", err)
 	}
@@ -939,7 +941,7 @@ func TestStatefulSetAvailabilityCheck(t *testing.T) {
 			t.Fatalf("%d: %v", i, err)
 		}
 	}
-	err := ssc.syncStatefulSet(ctx, set, pods)
+	err := ssc.syncStatefulSet(tCtx, set, pods)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -963,9 +965,7 @@ func TestStatefulSetAvailabilityCheck(t *testing.T) {
 	}
 
 	// RS should be re-queued after 700ms to recompute .status.availableReplicas (200ms extra for the test).
-	ktesting.Eventually(ctx, func(tCtx ktesting.TContext) int {
-		return ssc.queue.Len()
-	}).WithTimeout(900*time.Millisecond).
+	tCtx.Eventually(ssc.queue.Len).WithTimeout(900*time.Millisecond).
 		WithPolling(10*time.Millisecond).
 		Should(gomega.Equal(1), " StatefulSet should be re-queued to recompute .status.availableReplicas")
 }
@@ -1043,7 +1043,7 @@ func scaleUpStatefulSetControllerBounded(logger klog.Logger, set *apps.StatefulS
 		fakeWorker(ssc)
 		pod = getPodAtOrdinal(pods, ord)
 		prev = *pod
-		if pods, err = om.setPodReadyCondition(set, ord, true); err != nil {
+		if pods, err = om.setPodReadyCondition(set, ord, true, time.Now()); err != nil {
 			return err
 		}
 		pod = getPodAtOrdinal(pods, ord)

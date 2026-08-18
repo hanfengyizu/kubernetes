@@ -41,6 +41,7 @@ func (f *RealFIFO) getItems() []Delta {
 
 const closedFIFOName = "FIFO WAS CLOSED"
 const isAtomic = "ATOMIC REPLACED OBJ"
+const isBookmark = "BOOKMARK OBJ"
 
 func popN(queue Queue, count int) []interface{} {
 	result := []interface{}{}
@@ -65,6 +66,9 @@ func testRealFIFOPop(f *RealFIFO) testFifoObject {
 			objs = append(objs, obj.(testFifoObject))
 		}
 		return testFifoObject{name: isAtomic, val: objs}
+	}
+	if val.(Deltas).Newest().Type == Bookmark {
+		return testFifoObject{name: isBookmark}
 	}
 	return val.(Deltas).Newest().Object.(testFifoObject)
 }
@@ -231,10 +235,17 @@ func TestRealFIFOW_ReplaceMakesDeletionsForObjectsOnlyInQueue(t *testing.T) {
 				{Deleted, DeletedFinalStateUnknown{Key: "foo", Obj: objV2}},
 			},
 		},
+		{
+			name: "Bookmark object should not be added without atomic",
+			operations: func(f *RealFIFO) {
+				f.bookmarkTest(t, "123")
+				f.replaceTest(t, []interface{}{}, "0")
+				f.replaceTest(t, []interface{}{}, "1")
+			},
+			expectedDeltas: Deltas{},
+		},
 	}
 	for _, tt := range table {
-		tt := tt
-
 		t.Run(tt.name, func(t *testing.T) {
 			// Test with a RealFIFO with a backing KnownObjects
 			fWithKnownObjects := NewRealFIFO(
@@ -1131,7 +1142,7 @@ func TestRealFIFO_PopMultipleDeltaInBatch(t *testing.T) {
 			for i, item := range tc.initialItems {
 				initialItems[i] = item
 			}
-			_ = f.Replace(initialItems, "")
+			_ = f.Replace(initialItems, "123")
 			for _, action := range tc.actions {
 				action(f)
 			}
@@ -1365,10 +1376,22 @@ func TestRealFIFO_ReplaceAtomic(t *testing.T) {
 				}},
 			},
 		},
+		{
+			name: "Bookmark object should not be included in Replace",
+			operations: func(f *RealFIFO) {
+				f.bookmarkTest(t, "123")
+				f.replaceTest(t, []interface{}{}, "1234")
+			},
+			expectedDeltas: Deltas{
+				{Type: Bookmark, Object: BookmarkInfo{ResourceVersion: "123"}},
+				{Type: ReplacedAll, Object: ReplacedAllInfo{
+					ResourceVersion: "1234",
+					Objects:         []interface{}{},
+				}},
+			},
+		},
 	}
 	for _, tt := range table {
-		tt := tt
-
 		t.Run(tt.name, func(t *testing.T) {
 			// Test with a RealFIFO with a backing KnownObjects
 			f := NewRealFIFO(
@@ -1379,6 +1402,7 @@ func TestRealFIFO_ReplaceAtomic(t *testing.T) {
 				nil,
 			)
 			f.emitAtomicEvents = true
+			f.emitDeltaTypeBookmark = true
 			tt.operations(f)
 			actualDeltasWithKnownObjects := popN(f, len(f.getItems()))
 			actualAsDeltas := collapseDeltas(actualDeltasWithKnownObjects)
@@ -1510,5 +1534,12 @@ func (f *RealFIFO) resyncTest(t *testing.T) {
 	err := f.Resync()
 	if err != nil {
 		t.Fatalf("Test error on RealFIFO resync: %s", err)
+	}
+}
+
+func (f *RealFIFO) bookmarkTest(t *testing.T, bookmark string) {
+	err := f.Bookmark(bookmark)
+	if err != nil {
+		t.Fatalf("Test error on RealFIFO bookmark: %s", err)
 	}
 }

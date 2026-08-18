@@ -143,12 +143,25 @@ func TestWriteKubeletConfigFiles(t *testing.T) {
 				},
 			},
 		},
+		{
+			name: "missing instance config file",
+			cfg: &kubeadmapi.InitConfiguration{
+				ClusterConfiguration: kubeadmapi.ClusterConfiguration{
+					ComponentConfigs: kubeadmapi.ComponentConfigMap{
+						componentconfigs.KubeletGroup: &componentConfig{},
+					},
+				},
+			},
+			expectedError: true,
+		},
 	}
 	for _, tc := range testCases {
-		err := WriteKubeletConfigFiles(tc.cfg, tempDir, tempDir, tc.patchesDir, true, os.Stdout)
-		if (err != nil) != tc.expectedError {
-			t.Fatalf("expected error: %v, got: %v, error: %v", tc.expectedError, err != nil, err)
-		}
+		t.Run(tc.name, func(t *testing.T) {
+			err := WriteKubeletConfigFiles(tc.cfg, tempDir, tempDir, tc.patchesDir, true, os.Stdout)
+			if (err != nil) != tc.expectedError {
+				t.Fatalf("expected error: %v, got: %v, error: %v", tc.expectedError, err != nil, err)
+			}
+		})
 	}
 }
 
@@ -372,7 +385,7 @@ func TestUnupgradedControlPlaneInstances(t *testing.T) {
 			for _, pod := range tc.pods {
 				runtimeObjs = append(runtimeObjs, &pod) // Use pointer
 			}
-			client := fake.NewClientset(runtimeObjs...)
+			client := fake.NewSimpleClientset(runtimeObjs...)
 
 			nodes, err := UnupgradedControlPlaneInstances(client, tc.currentNode)
 			if tc.expectError != (err != nil) {

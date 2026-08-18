@@ -27,7 +27,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/dynamic-resource-allocation/resourceslice"
-	"k8s.io/kubernetes/test/utils/ktesting"
+	"k8s.io/kubernetes/test/utils/client-go/ktesting"
 )
 
 // TestCreateResourceSlices uses the ResourceSlice controller to create slices.
@@ -42,18 +42,19 @@ func TestCreateResourceSlices(tCtx ktesting.TContext, numSlices int) {
 	domain := strings.Repeat("x", resourceapi.DeviceMaxDomainLength-len(domainSuffix)) + domainSuffix
 	stringValue := strings.Repeat("v", resourceapi.DeviceAttributeMaxValueLength)
 	pool := resourceslice.Pool{
-		Slices: make([]resourceslice.Slice, numSlices),
+		Slices:   make([]resourceslice.Slice, numSlices),
+		AllNodes: true,
 	}
 	numDevices := 0
-	for i := 0; i < numSlices; i++ {
+	for i := range numSlices {
 		devices := make([]resourceapi.Device, resourceapi.ResourceSliceMaxDevices)
-		for e := 0; e < resourceapi.ResourceSliceMaxDevices; e++ {
+		for e := range resourceapi.ResourceSliceMaxDevices {
 			device := resourceapi.Device{
 				Name:       devicePrefix + strings.Repeat("x", validation.DNS1035LabelMaxLength-len(devicePrefix)-6) + fmt.Sprintf("%06d", numDevices),
 				Attributes: make(map[resourceapi.QualifiedName]resourceapi.DeviceAttribute, resourceapi.ResourceSliceMaxAttributesAndCapacitiesPerDevice),
 			}
 			numDevices++
-			for j := 0; j < resourceapi.ResourceSliceMaxAttributesAndCapacitiesPerDevice; j++ {
+			for j := range resourceapi.ResourceSliceMaxAttributesAndCapacitiesPerDevice {
 				name := resourceapi.QualifiedName(domain + "/" + strings.Repeat("x", resourceapi.DeviceMaxIDLength-4) + fmt.Sprintf("%04d", j))
 				device.Attributes[name] = resourceapi.DeviceAttribute{
 					StringValue: &stringValue,
@@ -115,13 +116,13 @@ func TestCreateResourceSlices(tCtx ktesting.TContext, numSlices int) {
 	// Ask the controller to delete all slices except for one empty slice.
 	tCtx.Log("Deleting slices")
 	resources = resources.DeepCopy()
-	resources.Pools[poolName] = resourceslice.Pool{Slices: []resourceslice.Slice{{}}}
+	resources.Pools[poolName] = resourceslice.Pool{Slices: []resourceslice.Slice{{}}, AllNodes: true}
 	controller.Update(resources)
 
-	// One empty slice should remain, after removing the full ones and adding the empty one.
+	// A slice should be updated to be empty, and the rest should be deleted.
 	emptySlice := gomega.HaveField("Spec.Devices", gomega.BeEmpty())
 	tCtx.Eventually(listSlices).WithTimeout(2 * time.Minute).Should(gomega.HaveField("Items", gomega.HaveExactElements(emptySlice)))
-	expectStats = resourceslice.Stats{NumCreates: int64(numSlices) + 1, NumDeletes: int64(numSlices)}
+	expectStats = resourceslice.Stats{NumCreates: int64(numSlices), NumUpdates: 1, NumDeletes: int64(numSlices) - 1}
 
 	// There is a window of time where the ResourceSlice exists and is
 	// returned in a list but before that ResourceSlice is accounted for

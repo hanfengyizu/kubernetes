@@ -32,6 +32,7 @@ import (
 	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1"
 	commontest "k8s.io/kubernetes/test/e2e/common"
 	e2emanifest "k8s.io/kubernetes/test/e2e/framework/manifest"
+	e2enode "k8s.io/kubernetes/test/e2e/framework/node"
 	e2epod "k8s.io/kubernetes/test/e2e/framework/pod"
 	e2etestfiles "k8s.io/kubernetes/test/e2e/framework/testfiles"
 	imageutils "k8s.io/kubernetes/test/utils/image"
@@ -78,12 +79,12 @@ func updateImageAllowList(ctx context.Context) {
 	} else {
 		e2epod.ImagePrePullList.Insert(sriovDevicePluginImage)
 	}
-	if samplePluginImage, err := getContainerImageFromE2ETestDaemonset(SampleDevicePluginDSYAML); err != nil {
+	if samplePluginImage, err := getContainerImageFromE2ETestDaemonset(e2enode.SampleDevicePluginDSYAML); err != nil {
 		klog.Errorln(err)
 	} else {
 		e2epod.ImagePrePullList.Insert(samplePluginImage)
 	}
-	if samplePluginImageCtrlReg, err := getContainerImageFromE2ETestDaemonset(SampleDevicePluginControlRegistrationDSYAML); err != nil {
+	if samplePluginImageCtrlReg, err := getContainerImageFromE2ETestDaemonset(e2enode.SampleDevicePluginControlRegistrationDSYAML); err != nil {
 		klog.Errorln(err)
 	} else {
 		e2epod.ImagePrePullList.Insert(samplePluginImageCtrlReg)
@@ -91,7 +92,7 @@ func updateImageAllowList(ctx context.Context) {
 }
 
 func getNodeProblemDetectorImage() string {
-	const defaultImage string = "registry.k8s.io/node-problem-detector/node-problem-detector:v1.34.0"
+	const defaultImage string = "registry.k8s.io/node-problem-detector/node-problem-detector:v1.35.2"
 	image := os.Getenv("NODE_PROBLEM_DETECTOR_IMAGE")
 	if image == "" {
 		image = defaultImage
@@ -130,8 +131,8 @@ func (rp *remotePuller) Remove(ctx context.Context, image string) error {
 	return rp.imageService.RemoveImage(ctx, &runtimeapi.ImageSpec{Image: image})
 }
 
-func getPuller() (puller, error) {
-	_, is, err := getCRIClient()
+func getPuller(ctx context.Context) (puller, error) {
+	_, is, err := getCRIClient(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -142,7 +143,7 @@ func getPuller() (puller, error) {
 
 // PrePullAllImages pre-fetches all images tests depend on so that we don't fail in an actual test.
 func PrePullAllImages(ctx context.Context) error {
-	puller, err := getPuller()
+	puller, err := getPuller(ctx)
 	if err != nil {
 		return err
 	}
@@ -179,7 +180,7 @@ func PrePullAllImages(ctx context.Context) error {
 					pullErr error
 					output  []byte
 				)
-				for retryCount := 0; retryCount < maxImagePullRetries; retryCount++ {
+				for retryCount := range maxImagePullRetries {
 					select {
 					case <-ctx.Done():
 						return
@@ -210,7 +211,7 @@ func PrePullAllImages(ctx context.Context) error {
 }
 
 func RemoveImage(ctx context.Context, image string) error {
-	puller, err := getPuller()
+	puller, err := getPuller(ctx)
 	if err != nil {
 		return err
 	}

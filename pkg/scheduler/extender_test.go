@@ -332,7 +332,7 @@ func TestSchedulerWithExtenders(t *testing.T) {
 			ctx, cancel := context.WithCancel(ctx)
 			defer cancel()
 
-			cache := internalcache.New(ctx, nil)
+			cache := internalcache.New(ctx, nil, false, false)
 			for _, name := range test.nodes {
 				cache.AddNode(logger, createNode(name))
 			}
@@ -358,8 +358,12 @@ func TestSchedulerWithExtenders(t *testing.T) {
 			}
 			sched.applyDefaultHandlers()
 
-			podIgnored := &v1.Pod{}
-			result, err := sched.SchedulePod(ctx, fwk, framework.NewCycleState(), podIgnored)
+			if err := sched.Cache.UpdateSnapshot(logger, sched.nodeInfoSnapshot); err != nil {
+				t.Fatalf("Unexpected error updating snapshot: %v", err)
+			}
+
+			podInfoIgnored := queuedPodInfoForPod(&v1.Pod{})
+			result, err := sched.SchedulePod(ctx, fwk, framework.NewCycleState(), podInfoIgnored)
 			if test.expectsErr {
 				if err == nil {
 					t.Errorf("Unexpected non-error, result %+v", result)

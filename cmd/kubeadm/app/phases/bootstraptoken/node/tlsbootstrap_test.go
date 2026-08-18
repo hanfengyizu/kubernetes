@@ -35,7 +35,7 @@ func TestAllowBootstrapTokensToPostCSRs(t *testing.T) {
 	}{
 		{
 			name:   "ClusterRoleBindings is empty",
-			client: clientsetfake.NewClientset(),
+			client: clientsetfake.NewSimpleClientset(),
 		},
 		{
 			name: "ClusterRoleBindings already exists",
@@ -92,7 +92,7 @@ func TestAutoApproveNodeBootstrapTokens(t *testing.T) {
 	}{
 		{
 			name:   "ClusterRoleBindings is empty",
-			client: clientsetfake.NewClientset(),
+			client: clientsetfake.NewSimpleClientset(),
 		},
 		{
 			name: "ClusterRoleBindings already exists",
@@ -149,7 +149,7 @@ func TestAutoApproveNodeCertificateRotation(t *testing.T) {
 	}{
 		{
 			name:   "ClusterRoleBindings is empty",
-			client: clientsetfake.NewClientset(),
+			client: clientsetfake.NewSimpleClientset(),
 		},
 		{
 			name: "ClusterRoleBindings already exists",
@@ -206,7 +206,7 @@ func TestAllowBootstrapTokensToGetNodes(t *testing.T) {
 	}{
 		{
 			name:   "RBAC rules are empty",
-			client: clientsetfake.NewClientset(),
+			client: clientsetfake.NewSimpleClientset(),
 		},
 		{
 			name: "RBAC rules already exists",
@@ -278,8 +278,65 @@ func TestAllowBootstrapTokensToGetNodes(t *testing.T) {
 	}
 }
 
+func TestAllowAPIServerToAccessKubeletAPI(t *testing.T) {
+	tests := []struct {
+		name   string
+		client clientset.Interface
+	}{
+		{
+			name:   "ClusterRoleBindings is empty",
+			client: clientsetfake.NewSimpleClientset(),
+		},
+		{
+			name: "ClusterRoleBindings already exists",
+			client: newMockClusterRoleBinddingClientForTest(t, &rbac.ClusterRoleBinding{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: constants.KubeletAPIAdminClusterRoleBindingName,
+				},
+				RoleRef: rbac.RoleRef{
+					APIGroup: rbac.GroupName,
+					Kind:     "ClusterRole",
+					Name:     constants.KubeletAPIAdminClusterRoleName,
+				},
+				Subjects: []rbac.Subject{
+					{
+						Kind: rbac.UserKind,
+						Name: constants.APIServerKubeletClientCertCommonName,
+					},
+				},
+			}),
+		},
+		{
+			name: "Create new ClusterRoleBindings",
+			client: newMockClusterRoleBinddingClientForTest(t, &rbac.ClusterRoleBinding{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: constants.KubeletAPIAdminClusterRoleBindingName,
+				},
+				RoleRef: rbac.RoleRef{
+					APIGroup: rbac.GroupName,
+					Kind:     "ClusterRole",
+					Name:     constants.KubeletAPIAdminClusterRoleName,
+				},
+				Subjects: []rbac.Subject{
+					{
+						Kind: rbac.GroupKind,
+						Name: constants.NodesGroup,
+					},
+				},
+			}),
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := AllowAPIServerToAccessKubeletAPI(tt.client); err != nil {
+				t.Errorf("AllowAPIServerToAccessKubeletAPI() return error = %v", err)
+			}
+		})
+	}
+}
+
 func newMockClusterRoleBinddingClientForTest(t *testing.T, clusterRoleBinding *rbac.ClusterRoleBinding) *clientsetfake.Clientset {
-	client := clientsetfake.NewClientset()
+	client := clientsetfake.NewSimpleClientset()
 	_, err := client.RbacV1().ClusterRoleBindings().Create(context.TODO(), clusterRoleBinding, metav1.CreateOptions{})
 
 	if err != nil {
@@ -289,7 +346,7 @@ func newMockClusterRoleBinddingClientForTest(t *testing.T, clusterRoleBinding *r
 }
 
 func newMockRbacClientForTest(t *testing.T, clusterRole *rbac.ClusterRole, clusterRoleBinding *rbac.ClusterRoleBinding) *clientsetfake.Clientset {
-	client := clientsetfake.NewClientset()
+	client := clientsetfake.NewSimpleClientset()
 	_, err := client.RbacV1().ClusterRoles().Create(context.TODO(), clusterRole, metav1.CreateOptions{})
 	if err != nil {
 		t.Fatalf("error creating ClusterRoles: %v", err)

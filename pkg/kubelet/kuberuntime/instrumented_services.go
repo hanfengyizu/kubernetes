@@ -181,7 +181,7 @@ func (in instrumentedRuntimeService) RunPodSandbox(ctx context.Context, config *
 	const operation = "run_podsandbox"
 	startTime := time.Now()
 	defer recordOperation(operation, startTime)
-	defer metrics.RunPodSandboxDuration.WithLabelValues(runtimeHandler).Observe(metrics.SinceInSeconds(startTime))
+	defer metrics.RunPodSandboxDuration.ObserveSince(startTime, runtimeHandler)()
 
 	out, err := in.service.RunPodSandbox(ctx, config, runtimeHandler)
 	recordError(operation, err)
@@ -335,11 +335,11 @@ func (in instrumentedImageManagerService) ImageFsInfo(ctx context.Context) (*run
 	return fsInfo, nil
 }
 
-func (in instrumentedImageManagerService) Close() error {
+func (in instrumentedImageManagerService) Close(ctx context.Context) error {
 	const operation = "close"
 	defer recordOperation(operation, time.Now())
 
-	err := in.service.Close()
+	err := in.service.Close(ctx)
 	recordError(operation, err)
 	return err
 }
@@ -351,6 +351,24 @@ func (in instrumentedRuntimeService) CheckpointContainer(ctx context.Context, op
 	err := in.service.CheckpointContainer(ctx, options)
 	recordError(operation, err)
 	return err
+}
+
+func (in instrumentedRuntimeService) CheckpointPod(ctx context.Context, options *runtimeapi.CheckpointPodRequest) error {
+	const operation = "checkpoint_pod"
+	defer recordOperation(operation, time.Now())
+
+	err := in.service.CheckpointPod(ctx, options)
+	recordError(operation, err)
+	return err
+}
+
+func (in instrumentedRuntimeService) RestorePod(ctx context.Context, options *runtimeapi.RestorePodRequest) (*runtimeapi.RestorePodResponse, error) {
+	const operation = "restore_pod"
+	defer recordOperation(operation, time.Now())
+
+	response, err := in.service.RestorePod(ctx, options)
+	recordError(operation, err)
+	return response, err
 }
 
 func (in instrumentedRuntimeService) GetContainerEvents(ctx context.Context, containerEventsCh chan *runtimeapi.ContainerEventResponse, connectionEstablishedCallback func(runtimeapi.RuntimeService_GetContainerEventsClient)) error {
@@ -389,11 +407,11 @@ func (in instrumentedRuntimeService) RuntimeConfig(ctx context.Context) (*runtim
 	return out, err
 }
 
-func (in instrumentedRuntimeService) Close() error {
+func (in instrumentedRuntimeService) Close(ctx context.Context) error {
 	const operation = "close"
 	defer recordOperation(operation, time.Now())
 
-	err := in.service.Close()
+	err := in.service.Close(ctx)
 	recordError(operation, err)
 	return err
 }

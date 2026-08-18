@@ -19,26 +19,28 @@ package cpumanager
 import (
 	"fmt"
 	"strconv"
-
-	"github.com/go-logr/logr"
+	"strings"
 
 	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	resourcehelper "k8s.io/component-helpers/resource"
 	"k8s.io/klog/v2"
 	podutil "k8s.io/kubernetes/pkg/api/v1/pod"
 	v1qos "k8s.io/kubernetes/pkg/apis/core/v1/helper/qos"
 	"k8s.io/kubernetes/pkg/features"
+	"k8s.io/kubernetes/pkg/kubelet/cm/admission"
 	"k8s.io/kubernetes/pkg/kubelet/cm/cpumanager/state"
 	"k8s.io/kubernetes/pkg/kubelet/cm/cpumanager/topology"
+	cmqos "k8s.io/kubernetes/pkg/kubelet/cm/qos"
 	"k8s.io/kubernetes/pkg/kubelet/cm/topologymanager"
 	"k8s.io/kubernetes/pkg/kubelet/cm/topologymanager/bitmask"
+	"k8s.io/kubernetes/pkg/kubelet/lifecycle"
 	"k8s.io/kubernetes/pkg/kubelet/metrics"
 	"k8s.io/utils/cpuset"
 )
 
 const (
-
 	// PolicyStatic is the name of the static policy.
 	// Should options be given, these will be ignored and backward (up to 1.21 included)
 	// compatible behaviour will be enforced
@@ -133,7 +135,7 @@ var _ Policy = &staticPolicy{}
 // NewStaticPolicy returns a CPU manager policy that does not change CPU
 // assignments for exclusively pinned guaranteed containers after the main
 // container process starts.
-func NewStaticPolicy(logger logr.Logger, topology *topology.CPUTopology, numReservedCPUs int, reservedCPUs cpuset.CPUSet, affinity topologymanager.Store, cpuPolicyOptions map[string]string) (Policy, error) {
+func NewStaticPolicy(logger klog.Logger, topology *topology.CPUTopology, numReservedCPUs int, reservedCPUs cpuset.CPUSet, affinity topologymanager.Store, cpuPolicyOptions map[string]string) (Policy, error) {
 	opts, err := NewStaticPolicyOptions(cpuPolicyOptions)
 	if err != nil {
 		return nil, err
@@ -192,7 +194,7 @@ func (p *staticPolicy) Name() string {
 	return string(PolicyStatic)
 }
 
-func (p *staticPolicy) Start(logger logr.Logger, s state.State) error {
+func (p *staticPolicy) Start(logger klog.Logger, s state.State) error {
 	if err := p.validateState(logger, s); err != nil {
 		logger.Error(err, "invalid state, please drain node and remove policy state file")
 		return err
@@ -201,7 +203,7 @@ func (p *staticPolicy) Start(logger logr.Logger, s state.State) error {
 	return nil
 }
 
-func (p *staticPolicy) validateState(logger logr.Logger, s state.State) error {
+func (p *staticPolicy) validateState(logger klog.Logger, s state.State) error {
 	tmpAssignments := s.GetCPUAssignments()
 	tmpDefaultCPUset := s.GetDefaultCPUSet()
 
@@ -262,6 +264,11 @@ func (p *staticPolicy) validateState(logger logr.Logger, s state.State) error {
 			tmpCPUSets = append(tmpCPUSets, cset)
 		}
 	}
+	if utilfeature.DefaultFeatureGate.Enabled(features.PodLevelResourceManagers) {
+		for _, podAssigments := range s.GetPodCPUAssignments() {
+			tmpCPUSets = append(tmpCPUSets, podAssigments.CPUSet)
+		}
+	}
 	totalKnownCPUs = totalKnownCPUs.Union(tmpCPUSets...)
 	if !totalKnownCPUs.Equals(allCPUs) {
 		return fmt.Errorf("current set of available CPUs %q doesn't match with CPUs in state %q",
@@ -280,10 +287,6 @@ func (p *staticPolicy) GetAllocatableCPUs(s state.State) cpuset.CPUSet {
 // GetAvailableCPUs returns the set of unassigned CPUs minus the reserved set.
 func (p *staticPolicy) GetAvailableCPUs(s state.State) cpuset.CPUSet {
 	return s.GetDefaultCPUSet().Difference(p.reservedCPUs)
-}
-
-func (p *staticPolicy) GetAvailablePhysicalCPUs(s state.State) cpuset.CPUSet {
-	return s.GetDefaultCPUSet().Difference(p.reservedPhysicalCPUs)
 }
 
 func (p *staticPolicy) updateCPUsToReuse(pod *v1.Pod, container *v1.Container, cset cpuset.CPUSet) {
@@ -316,29 +319,282 @@ func (p *staticPolicy) updateCPUsToReuse(pod *v1.Pod, container *v1.Container, c
 	p.cpusToReuse[string(pod.UID)] = p.cpusToReuse[string(pod.UID)].Difference(cset)
 }
 
-func (p *staticPolicy) Allocate(logger logr.Logger, s state.State, pod *v1.Pod, container *v1.Container) (rerr error) {
-	logger = klog.LoggerWithValues(logger, "pod", klog.KObj(pod), "podUID", pod.UID, "containerName", container.Name)
+// validatePodScopeResources checks for the "empty shared pool" scenario. This occurs
+// when the sum of exclusive container CPU requests consumes the entire pod-level
+// budget, leaving no CPUs for containers that require a shared pool. Such a
+// configuration is invalid because it would lead to containers in the shared
+// pool having an empty cpuset, causing them to run on the node's shared pool
+// and breaking NUMA affinity.
+func (p *staticPolicy) validatePodScopeResources(logger klog.Logger, pod *v1.Pod) error {
+	podTotalCPUs := p.podGuaranteedCPUs(logger, pod)
+
+	hasSharedLongRunningContainers := false
+	// Sum CPU requests for all containers that run for the full pod lifetime
+	// (main containers and restartable init containers) to determine the
+	// total exclusive CPU usage that might impact the shared pool.
+	sumOfLongRunningExclusiveCPUs := 0
+
+	// Check for empty shared pool for standard init containers.
+	for _, container := range pod.Spec.InitContainers {
+		guaranteedCPUs := p.guaranteedCPUs(logger, pod, &container)
+
+		if !podutil.IsRestartableInitContainer(&container) {
+			if guaranteedCPUs == 0 && sumOfLongRunningExclusiveCPUs >= podTotalCPUs {
+				// This check ensures that if there are any standard init containers that need a
+				// shared pool, that pool is not empty. An empty pool would occur if the pod
+				// budget is fully consumed by sidecars.
+				return fmt.Errorf("pod rejected, pod has shared init containers but no cpus available for them")
+			}
+		} else {
+			// If there are restartable init containers, keep track for the empty shared pool check.
+			if guaranteedCPUs == 0 {
+				hasSharedLongRunningContainers = true
+			} else {
+				sumOfLongRunningExclusiveCPUs += guaranteedCPUs
+			}
+		}
+	}
+
+	// Check for empty shared pool for concurrently running containers (app and restartable init containers).
+	for _, container := range pod.Spec.Containers {
+		guaranteedCPUs := p.guaranteedCPUs(logger, pod, &container)
+
+		if guaranteedCPUs == 0 {
+			hasSharedLongRunningContainers = true
+		} else {
+			sumOfLongRunningExclusiveCPUs += guaranteedCPUs
+		}
+	}
+
+	// This check ensures that if there are any standard containers that need a shared
+	// pool, that pool is not empty. An empty pool would occur if the pod budget is
+	// fully consumed by sidecars and main containers with exclusive resources.
+	if hasSharedLongRunningContainers && sumOfLongRunningExclusiveCPUs >= podTotalCPUs {
+		return fmt.Errorf("pod rejected, sum of exclusive container cpu requests equals pod budget, leaving no cpus for shared containers")
+	}
+
+	return nil
+}
+
+// This function is the entry point for pod-level resource allocation.
+// It's called once per pod by the Topology Manager's pod-scope admit handler.
+// The logic here allocates a single "bubble" of CPUs for the entire pod
+// and then partitions that bubble among the containers.
+func (p *staticPolicy) AllocatePod(logger klog.Logger, s state.State, pod *v1.Pod, operation lifecycle.Operation) (rerr error) {
+	logger = klog.LoggerWithValues(logger, "pod", klog.KObj(pod), "podUID", pod.UID, "operation", operation)
+	logger.V(4).Info("AllocatePod called for pod-level managed pod")
+
+	// Static policy supports only Add pod-level resource allocation operation.
+	switch operation {
+	case lifecycle.AddOperation:
+		return p.allocatePodForAdd(logger, s, pod)
+	default:
+		logger.V(2).Info("CPU Manager pod-level resource allocation skipped, operation not supported by the static CPU manager policy")
+		return nil
+	}
+}
+
+func (p *staticPolicy) allocatePodForAdd(logger klog.Logger, s state.State, pod *v1.Pod) (rerr error) {
+	podUID := string(pod.UID)
+	// 1. Calculate the total number of CPUs required for the pod, considering init container reuse.
+	totalPodCPUs := p.podGuaranteedCPUs(logger, pod)
+	if totalPodCPUs == 0 {
+		// pod belongs in the shared pool (nothing to do; use default cpuset)
+		return nil
+	}
+	logger.V(4).Info("Calculated total pod CPUs", "totalCPUs", totalPodCPUs)
+
+	defer func() {
+		if rerr != nil {
+			metrics.CPUManagerPinningErrorsTotal.Inc()
+			metrics.ResourceManagerAllocationErrorsTotal.WithLabelValues(metrics.ResourceManagerCPU, metrics.ResourceManagerPod).Inc()
+		}
+	}()
+
+	// 2. Validate for the "empty shared pool" case.
+	// Even though this is checked during hint generation, we must re-evaluate it here.
+	// If the Topology Manager is running with the "best-effort" or "none" policies,
+	// it will still admit the pod even if GetPodTopologyHints returns an empty hint list.
+	// This ensures we explicitly reject the pod during allocation to prevent Kubelet
+	// from attempting to create invalid cgroups (e.g., an empty cpuset.cpus) for shared containers.
+	if err := p.validatePodScopeResources(logger, pod); err != nil {
+		return admission.NewEmptyPodSharedPoolError(err)
+	}
+
+	// 3. Enforce SMT alignment policy if FullPhysicalCPUsOnly is enabled.
+	if err := p.enforceSMTAlignment(s, totalPodCPUs); err != nil {
+		return err
+	}
+
+	// 4. Allocate the entire CPU "bubble" for the pod using the hint from the Topology Manager.
+	hint := p.affinity.GetAffinity(logger, podUID, append(pod.Spec.InitContainers, pod.Spec.Containers...)[0].Name)
+	podAllocation, err := p.allocateCPUs(logger, s, totalPodCPUs, hint.NUMANodeAffinity, cpuset.New())
+	if err != nil {
+		logger.Error(err, "Unable to allocate CPUs for pod", "totalPodCPUs", totalPodCPUs)
+		return err
+	}
+	p.updateMetricsOnAllocate(logger, s, podAllocation)
+	logger.V(4).Info("Allocated pod-level CPU bubble", "allocation", podAllocation.CPUs)
+
+	// Store the pod-level allocation in the state.
+	s.SetPodCPUSet(podUID, podAllocation.CPUs)
+
+	// 5. Partition the pod's allocation, handling init container CPU reuse correctly.
+	exclusiveCPUs := make(map[string]cpuset.CPUSet)
+	sidecarCPUs := cpuset.New()
+
+	// First, iterate through all init containers and allocate their CPUs from the initial pod bubble.
+	for _, c := range pod.Spec.InitContainers {
+		if numCPUs := p.guaranteedCPUs(logger, pod, &c); numCPUs > 0 {
+			metrics.CPUManagerPinningRequestsTotal.Inc()
+			// The pool available for this init container is the entire pod allocation
+			// minus what's already taken by sidecars.
+			runnablePool := podAllocation.CPUs.Difference(sidecarCPUs)
+			cset, err := p.takeByTopology(logger, runnablePool, numCPUs)
+			if err != nil {
+				return err
+			}
+			metrics.ResourceManagerContainerAssignments.WithLabelValues(metrics.ResourceManagerCPU, metrics.ResourceManagerExclusivePod).Inc()
+			exclusiveCPUs[c.Name] = cset
+
+			// If it's a restartable sidecar, its CPUs are permanently consumed.
+			if podutil.IsRestartableInitContainer(&c) {
+				sidecarCPUs = sidecarCPUs.Union(cset)
+			}
+		} else {
+			// Restartable init containers will access the main pod shared pool.
+			if podutil.IsRestartableInitContainer(&c) {
+				continue
+			}
+
+			// Non restartable init containers will have access to the whole pod pool
+			// amount minus the sidecar exclusive CPUs up to that point.
+			runnablePool := podAllocation.CPUs.Difference(sidecarCPUs)
+			metrics.ResourceManagerContainerAssignments.WithLabelValues(metrics.ResourceManagerCPU, metrics.ResourceManagerSharedPod).Inc()
+			exclusiveCPUs[c.Name] = runnablePool
+		}
+	}
+
+	// Explicitly record that the full CPU bubble is available again, minus what sidecars are using.
+	// This avoids carrying forward complex accounting from standard init containers.
+	podSharedPool := podAllocation.CPUs.Difference(sidecarCPUs)
+
+	// Second, iterate through regular containers, allocating from the remaining pool.
+	for _, c := range pod.Spec.Containers {
+		if numCPUs := p.guaranteedCPUs(logger, pod, &c); numCPUs > 0 {
+			metrics.CPUManagerPinningRequestsTotal.Inc()
+			cset, err := p.takeByTopology(logger, podSharedPool, numCPUs)
+			if err != nil {
+				return err
+			}
+			metrics.ResourceManagerContainerAssignments.WithLabelValues(metrics.ResourceManagerCPU, metrics.ResourceManagerExclusivePod).Inc()
+			exclusiveCPUs[c.Name] = cset
+			// Consume CPUs from the app container pool.
+			podSharedPool = podSharedPool.Difference(cset)
+		}
+	}
+
+	logger.V(4).Info("Partitioned pod-level CPU allocation", "exclusiveCPUs", podCPUAllocationToString(exclusiveCPUs), "podSharedPool", podSharedPool)
+
+	// 6. Save all container assignments to the state.
+	for _, c := range append(pod.Spec.InitContainers, pod.Spec.Containers...) {
+		if cset, isExclusive := exclusiveCPUs[c.Name]; isExclusive {
+			s.SetCPUSet(podUID, c.Name, cset)
+		} else {
+			s.SetCPUSet(podUID, c.Name, podSharedPool)
+			metrics.ResourceManagerContainerAssignments.WithLabelValues(metrics.ResourceManagerCPU, metrics.ResourceManagerSharedPod).Inc()
+		}
+
+		metrics.ResourceManagerAllocationsTotal.WithLabelValues(metrics.ResourceManagerCPU, metrics.ResourceManagerPod).Inc()
+	}
+
+	return nil
+}
+
+func podCPUAllocationToString(alloc map[string]cpuset.CPUSet) string {
+	if len(alloc) == 0 {
+		return ""
+	}
+	var sb strings.Builder
+	for name, cset := range alloc {
+		fmt.Fprintf(&sb, ",%s={%s}", name, cset)
+	}
+	// if we gone so far, it means we have at least 1 alloc, so the cut is safe
+	repr := sb.String()[1:]
+	return "<" + repr + ">"
+}
+
+func (p *staticPolicy) enforceSMTAlignment(s state.State, numCPUs int) error {
+	if !p.options.FullPhysicalCPUsOnly {
+		return nil
+	}
+
+	if (numCPUs % p.cpuGroupSize) != 0 {
+		// Since CPU Manager has been enabled requesting strict SMT alignment, it means a guaranteed pod can only be admitted
+		// if the CPU requested is a multiple of the number of virtual cpus per physical cores.
+		// In case CPU request is not a multiple of the number of virtual cpus per physical cores the Pod will be put
+		// in Failed state, with SMTAlignmentError as reason. Since the allocation happens in terms of physical cores
+		// and the scheduler is responsible for ensuring that the workload goes to a node that has enough CPUs,
+		// the pod would be placed on a node where there are enough physical cores available to be allocated.
+		// Just like the behaviour in case of static policy, takeByTopology will try to first allocate CPUs from the same socket
+		// and only in case the request cannot be sattisfied on a single socket, CPU allocation is done for a workload to occupy all
+		// CPUs on a physical core. Allocation of individual threads would never have to occur.
+		return SMTAlignmentError{
+			RequestedCPUs:        numCPUs,
+			CpusPerCore:          p.cpuGroupSize,
+			CausedByPhysicalCPUs: false,
+		}
+	}
+
+	availablePhysicalCPUs := s.GetDefaultCPUSet().Difference(p.reservedPhysicalCPUs).Size()
+
+	// It's legal to reserve CPUs which are not core siblings. In this case the CPU allocator can descend to single cores
+	// when picking CPUs. This will void the guarantee of FullPhysicalCPUsOnly. To prevent this, we need to additionally consider
+	// all the core siblings of the reserved CPUs as unavailable when computing the free CPUs, before to start the actual allocation.
+	// This way, by construction all possible CPUs allocation whose number is multiple of the SMT level are now correct again.
+	if numCPUs > availablePhysicalCPUs {
+		return SMTAlignmentError{
+			RequestedCPUs:         numCPUs,
+			CpusPerCore:           p.cpuGroupSize,
+			AvailablePhysicalCPUs: availablePhysicalCPUs,
+			CausedByPhysicalCPUs:  true,
+		}
+	}
+	return nil
+}
+
+func (p *staticPolicy) Allocate(logger klog.Logger, s state.State, pod *v1.Pod, container *v1.Container, operation lifecycle.Operation) (rerr error) {
+	logger = klog.LoggerWithValues(logger, "pod", klog.KObj(pod), "podUID", pod.UID, "containerName", container.Name, "operation", operation)
 	logger.Info("Allocate start") // V=0 for backward compatibility
 	defer logger.V(2).Info("Allocate end")
 
+	switch operation {
+	case lifecycle.AddOperation:
+		return p.allocateForAdd(logger, s, pod, container)
+	default:
+		logger.V(2).Info("CPU Manager container-level resource allocation skipped, operation not supported by the static CPU manager policy")
+		return nil
+	}
+}
+
+func (p *staticPolicy) allocateForAdd(logger klog.Logger, s state.State, pod *v1.Pod, container *v1.Container) (rerr error) {
 	numCPUs := p.guaranteedCPUs(logger, pod, container)
 	if numCPUs == 0 {
 		// container belongs in the shared pool (nothing to do; use default cpuset)
 		return nil
 	}
 
-	if utilfeature.DefaultFeatureGate.Enabled(features.PodLevelResources) && resourcehelper.IsPodLevelResourcesSet(pod) {
-		logger.Info("CPU Manager allocation skipped, pod is using pod-level resources which are not supported by the static CPU manager policy")
+	if (!utilfeature.DefaultFeatureGate.Enabled(features.PodLevelResourceManagers) || !utilfeature.DefaultFeatureGate.Enabled(features.PodLevelResources)) && resourcehelper.IsPodLevelResourcesSet(pod) {
+		logger.V(2).Info("CPU Manager allocation skipped, pod is using pod-level resources but the PodLevelResourceManagers feature gate is not enabled", "pod", klog.KObj(pod), "podUID", pod.UID)
 		return nil
 	}
-
-	logger.Info("Static policy: Allocate")
 
 	// container belongs in an exclusively allocated pool
 	metrics.CPUManagerPinningRequestsTotal.Inc()
 	defer func() {
 		if rerr != nil {
 			metrics.CPUManagerPinningErrorsTotal.Inc()
+			metrics.ResourceManagerAllocationErrorsTotal.WithLabelValues(metrics.ResourceManagerCPU, metrics.ResourceManagerNode).Inc()
 			if p.options.FullPhysicalCPUsOnly {
 				metrics.ContainerAlignedComputeResourcesFailure.WithLabelValues(metrics.AlignScopeContainer, metrics.AlignedPhysicalCPU).Inc()
 			}
@@ -351,47 +607,23 @@ func (p *staticPolicy) Allocate(logger logr.Logger, s state.State, pod *v1.Pod, 
 		}
 	}()
 
-	if p.options.FullPhysicalCPUsOnly {
-		if (numCPUs % p.cpuGroupSize) != 0 {
-			// Since CPU Manager has been enabled requesting strict SMT alignment, it means a guaranteed pod can only be admitted
-			// if the CPU requested is a multiple of the number of virtual cpus per physical cores.
-			// In case CPU request is not a multiple of the number of virtual cpus per physical cores the Pod will be put
-			// in Failed state, with SMTAlignmentError as reason. Since the allocation happens in terms of physical cores
-			// and the scheduler is responsible for ensuring that the workload goes to a node that has enough CPUs,
-			// the pod would be placed on a node where there are enough physical cores available to be allocated.
-			// Just like the behaviour in case of static policy, takeByTopology will try to first allocate CPUs from the same socket
-			// and only in case the request cannot be sattisfied on a single socket, CPU allocation is done for a workload to occupy all
-			// CPUs on a physical core. Allocation of individual threads would never have to occur.
-			return SMTAlignmentError{
-				RequestedCPUs:        numCPUs,
-				CpusPerCore:          p.cpuGroupSize,
-				CausedByPhysicalCPUs: false,
-			}
-		}
-
-		availablePhysicalCPUs := p.GetAvailablePhysicalCPUs(s).Size()
-
-		// It's legal to reserve CPUs which are not core siblings. In this case the CPU allocator can descend to single cores
-		// when picking CPUs. This will void the guarantee of FullPhysicalCPUsOnly. To prevent this, we need to additionally consider
-		// all the core siblings of the reserved CPUs as unavailable when computing the free CPUs, before to start the actual allocation.
-		// This way, by construction all possible CPUs allocation whose number is multiple of the SMT level are now correct again.
-		if numCPUs > availablePhysicalCPUs {
-			return SMTAlignmentError{
-				RequestedCPUs:         numCPUs,
-				CpusPerCore:           p.cpuGroupSize,
-				AvailablePhysicalCPUs: availablePhysicalCPUs,
-				CausedByPhysicalCPUs:  true,
-			}
-		}
-	}
+	// Checking the checkpoint state before SMT alignment validation means that
+	// existing allocations are preserved even if they violate the current policy.
+	// For example, if kubelet previously ran with full-pcpus-only=false and is
+	// restarted with full-pcpus-only=true, checkpointed allocations that don't
+	// satisfy SMT alignment are accepted to avoid disrupting running workloads.
 	if cset, ok := s.GetCPUSet(string(pod.UID), container.Name); ok {
 		p.updateCPUsToReuse(pod, container, cset)
 		logger.Info("Static policy: container already present in state, skipping")
 		return nil
 	}
 
+	if err := p.enforceSMTAlignment(s, numCPUs); err != nil {
+		return err
+	}
+
 	// Call Topology Manager to get the aligned socket affinity across all hint providers.
-	hint := p.affinity.GetAffinity(string(pod.UID), container.Name)
+	hint := p.affinity.GetAffinity(logger, string(pod.UID), container.Name)
 	logger.Info("Topology Affinity", "affinity", hint)
 
 	// Allocate CPUs according to the NUMA affinity contained in the hint.
@@ -404,6 +636,8 @@ func (p *staticPolicy) Allocate(logger logr.Logger, s state.State, pod *v1.Pod, 
 	s.SetCPUSet(string(pod.UID), container.Name, cpuAllocation.CPUs)
 	p.updateCPUsToReuse(pod, container, cpuAllocation.CPUs)
 	p.updateMetricsOnAllocate(logger, s, cpuAllocation)
+	metrics.ResourceManagerAllocationsTotal.WithLabelValues(metrics.ResourceManagerCPU, metrics.ResourceManagerNode).Inc()
+	metrics.ResourceManagerContainerAssignments.WithLabelValues(metrics.ResourceManagerCPU, metrics.ResourceManagerExclusiveNode).Inc()
 
 	logger.V(4).Info("Allocated exclusive CPUs", "cpuset", cpuAllocation.CPUs.String())
 	return nil
@@ -422,26 +656,44 @@ func getAssignedCPUsOfSiblings(s state.State, podUID string, containerName strin
 	return cset
 }
 
-func (p *staticPolicy) RemoveContainer(logger logr.Logger, s state.State, podUID string, containerName string) error {
+func (p *staticPolicy) RemoveContainer(logger klog.Logger, s state.State, podUID string, containerName string) error {
 	logger = klog.LoggerWithValues(logger, "podUID", podUID, "containerName", containerName)
 	logger.Info("RemoveContainer start") // backward compatibility
 	defer logger.V(4).Info("RemoveContainer start")
-	cpusInUse := getAssignedCPUsOfSiblings(s, podUID, containerName)
 	toRelease, ok := s.GetCPUSet(podUID, containerName)
 	if !ok {
 		return nil
 	}
 	s.Delete(podUID, containerName)
+
+	// Check if this pod is managed with pod-level CPUs.
+	if utilfeature.DefaultFeatureGate.Enabled(features.PodLevelResourceManagers) {
+		if podCPUSet, isPodLevel := s.GetPodCPUSet(podUID); isPodLevel {
+			// If this was the last container for the pod, then release the entire pod-level CPU set.
+			if len(s.GetCPUAssignments()[podUID]) == 0 {
+				updatedCPUSets := s.GetDefaultCPUSet().Union(podCPUSet)
+				s.SetDefaultCPUSet(updatedCPUSets)
+				s.DeletePod(podUID) // Clean up all state for the pod.
+				p.updateMetricsOnRelease(logger, s, podCPUSet)
+				logger.Info("Released pod-level CPUs", "defaultCPUSet", updatedCPUSets)
+			}
+			// If other containers still exist, do not release any CPUs yet.
+			// The pod-level CPUs will be released when the last container is removed.
+			return nil
+		}
+	}
+
+	cpusInUse := getAssignedCPUsOfSiblings(s, podUID, containerName)
 	// Mutate the shared pool, adding released cpus.
 	toRelease = toRelease.Difference(cpusInUse)
 	updatedCPUs := s.GetDefaultCPUSet().Union(toRelease)
 	s.SetDefaultCPUSet(updatedCPUs)
 	p.updateMetricsOnRelease(logger, s, toRelease)
-	logger.Info(" RemoveContainer end", "defaultCPUSet", updatedCPUs)
+	logger.Info("RemoveContainer end", "defaultCPUSet", updatedCPUs)
 	return nil
 }
 
-func (p *staticPolicy) allocateCPUs(logger logr.Logger, s state.State, numCPUs int, numaAffinity bitmask.BitMask, reusableCPUs cpuset.CPUSet) (topology.Allocation, error) {
+func (p *staticPolicy) allocateCPUs(logger klog.Logger, s state.State, numCPUs int, numaAffinity bitmask.BitMask, reusableCPUs cpuset.CPUSet) (topology.Allocation, error) {
 	logger.Info("AllocateCPUs", "numCPUs", numCPUs, "socket", numaAffinity)
 
 	allocatableCPUs := p.GetAvailableCPUs(s).Union(reusableCPUs)
@@ -479,25 +731,57 @@ func (p *staticPolicy) allocateCPUs(logger logr.Logger, s state.State, numCPUs i
 	return result, nil
 }
 
-func (p *staticPolicy) guaranteedCPUs(logger logr.Logger, pod *v1.Pod, container *v1.Container) int {
+func isIntegralCPUAmount(cpuQuantity resource.Quantity) bool {
+	return cpuQuantity.Value()*1000 == cpuQuantity.MilliValue()
+}
+
+func (p *staticPolicy) guaranteedCPUs(logger klog.Logger, pod *v1.Pod, container *v1.Container) int {
 	qos := v1qos.GetPodQOS(pod)
 	if qos != v1.PodQOSGuaranteed {
 		logger.V(5).Info("Exclusive CPU allocation skipped, pod QoS is not guaranteed", "qos", qos)
 		return 0
 	}
+
 	cpuQuantity := container.Resources.Requests[v1.ResourceCPU]
+
+	// For pod-level resource management, a container is only considered for exclusive
+	// CPUs if its request equals its limit for both the CPU and Memory. This
+	// aligns with the Guaranteed QoS requirement for container-level resources.
+	if utilfeature.DefaultFeatureGate.Enabled(features.PodLevelResourceManagers) && resourcehelper.IsPodLevelResourcesSet(pod) && !cmqos.IsContainerEquivalentQOSGuaranteed(container) {
+		logger.V(5).Info("Exclusive CPU allocation skipped, container is not eligible, request and limit are not equal", "pod", klog.KObj(pod), "containerName", container.Name)
+		return 0
+	}
+
 	cpuValue := cpuQuantity.Value()
-	if cpuValue*1000 != cpuQuantity.MilliValue() {
-		logger.V(5).Info("Exclusive CPU allocation skipped, pod requested non-integral CPUs", "cpu", cpuValue)
+	if !isIntegralCPUAmount(cpuQuantity) {
+		logger.V(5).Info("Exclusive CPU allocation skipped, container requested non-integral CPUs", "pod", klog.KObj(pod), "containerName", container.Name, "cpu", cpuValue)
 		return 0
 	}
 	// Safe downcast to do for all systems with < 2.1 billion CPUs.
 	// Per the language spec, `int` is guaranteed to be at least 32 bits wide.
 	// https://golang.org/ref/spec#Numeric_types
-	return int(cpuQuantity.Value())
+	return int(cpuValue)
 }
 
-func (p *staticPolicy) podGuaranteedCPUs(logger logr.Logger, pod *v1.Pod) int {
+func (p *staticPolicy) podGuaranteedCPUs(logger klog.Logger, pod *v1.Pod) int {
+	// If pod-level resources are set, use them directly.
+	// This check is important because this function is called from GetPodTopologyHints,
+	// which runs before the main feature gate check in AllocatePod.
+	if utilfeature.DefaultFeatureGate.Enabled(features.PodLevelResourceManagers) && resourcehelper.IsPodLevelResourcesSet(pod) {
+		qos := v1qos.GetPodQOS(pod)
+		if qos != v1.PodQOSGuaranteed {
+			return 0
+		}
+
+		if cpuQuantity, ok := pod.Spec.Resources.Requests[v1.ResourceCPU]; ok {
+			// We only consider integer CPU requests for guaranteed CPUs at the pod level.
+			if isIntegralCPUAmount(cpuQuantity) {
+				return int(cpuQuantity.Value())
+			}
+		}
+		return 0
+	}
+
 	// The maximum of requested CPUs by init containers.
 	requestedByInitContainers := 0
 	requestedByRestartableInitContainers := 0
@@ -531,7 +815,7 @@ func (p *staticPolicy) podGuaranteedCPUs(logger logr.Logger, pod *v1.Pod) int {
 	return requestedByLongRunningContainers
 }
 
-func (p *staticPolicy) takeByTopology(logger logr.Logger, availableCPUs cpuset.CPUSet, numCPUs int) (cpuset.CPUSet, error) {
+func (p *staticPolicy) takeByTopology(logger klog.Logger, availableCPUs cpuset.CPUSet, numCPUs int) (cpuset.CPUSet, error) {
 	cpuSortingStrategy := CPUSortingStrategyPacked
 	if p.options.DistributeCPUsAcrossCores {
 		cpuSortingStrategy = CPUSortingStrategySpread
@@ -542,14 +826,24 @@ func (p *staticPolicy) takeByTopology(logger logr.Logger, availableCPUs cpuset.C
 		if p.options.FullPhysicalCPUsOnly {
 			cpuGroupSize = p.cpuGroupSize
 		}
-		return takeByTopologyNUMADistributed(logger, p.topology, availableCPUs, numCPUs, cpuGroupSize, cpuSortingStrategy)
+		return takeByTopologyNUMADistributed(logger, p.topology, availableCPUs, numCPUs, cpuGroupSize, cpuSortingStrategy, p.options.AlignBySocket)
 	}
 
 	return takeByTopologyNUMAPacked(logger, p.topology, availableCPUs, numCPUs, cpuSortingStrategy, p.options.PreferAlignByUncoreCacheOption)
 }
 
-func (p *staticPolicy) GetTopologyHints(logger logr.Logger, s state.State, pod *v1.Pod, container *v1.Container) map[string][]topologymanager.TopologyHint {
-	logger = klog.LoggerWithValues(logger, "pod", klog.KObj(pod), "podUID", pod.UID, "containerName", container.Name)
+func (p *staticPolicy) GetTopologyHints(logger klog.Logger, s state.State, pod *v1.Pod, container *v1.Container, operation lifecycle.Operation) map[string][]topologymanager.TopologyHint {
+	logger = klog.LoggerWithValues(logger, "pod", klog.KObj(pod), "podUID", pod.UID, "containerName", container.Name, "operation", operation)
+	switch operation {
+	case lifecycle.AddOperation:
+		return p.getTopologyHintsForAdd(logger, s, pod, container)
+	default:
+		logger.V(2).Info("CPU Manager container-level hint generation skipped, operation not supported by the static CPU manager policy")
+		return nil
+	}
+}
+
+func (p *staticPolicy) getTopologyHintsForAdd(logger klog.Logger, s state.State, pod *v1.Pod, container *v1.Container) map[string][]topologymanager.TopologyHint {
 
 	// Get a count of how many guaranteed CPUs have been requested.
 	requested := p.guaranteedCPUs(logger, pod, container)
@@ -562,8 +856,10 @@ func (p *staticPolicy) GetTopologyHints(logger logr.Logger, s state.State, pod *
 		return nil
 	}
 
-	if utilfeature.DefaultFeatureGate.Enabled(features.PodLevelResources) && resourcehelper.IsPodLevelResourcesSet(pod) {
-		logger.V(3).Info("CPU Manager hint generation skipped, pod is using pod-level resources which are not supported by the static CPU manager policy", "pod", klog.KObj(pod), "podUID", pod.UID)
+	// If the pod has pod-level resources but the feature gate is disabled,
+	// log it and return nil hints to admit the pod without alignment.
+	if (!utilfeature.DefaultFeatureGate.Enabled(features.PodLevelResourceManagers) || !utilfeature.DefaultFeatureGate.Enabled(features.PodLevelResources)) && resourcehelper.IsPodLevelResourcesSet(pod) {
+		logger.V(3).Info("CPU Manager hint generation skipped, pod is using pod-level resources but the PodLevelResourceManagers feature gate is not enabled")
 		return nil
 	}
 
@@ -582,7 +878,7 @@ func (p *staticPolicy) GetTopologyHints(logger logr.Logger, s state.State, pod *
 		}
 		logger.Info("Regenerating TopologyHints for CPUs already allocated")
 		return map[string][]topologymanager.TopologyHint{
-			string(v1.ResourceCPU): p.generateCPUTopologyHints(allocated, cpuset.CPUSet{}, requested),
+			string(v1.ResourceCPU): p.generateCPUTopologyHints(allocated, cpuset.New(), requested),
 		}
 	}
 
@@ -602,7 +898,18 @@ func (p *staticPolicy) GetTopologyHints(logger logr.Logger, s state.State, pod *
 	}
 }
 
-func (p *staticPolicy) GetPodTopologyHints(logger logr.Logger, s state.State, pod *v1.Pod) map[string][]topologymanager.TopologyHint {
+func (p *staticPolicy) GetPodTopologyHints(logger klog.Logger, s state.State, pod *v1.Pod, operation lifecycle.Operation) map[string][]topologymanager.TopologyHint {
+	logger = klog.LoggerWithValues(logger, "pod", klog.KObj(pod), "podUID", pod.UID, "operation", operation)
+	switch operation {
+	case lifecycle.AddOperation:
+		return p.getPodTopologyHintsForAdd(logger, s, pod)
+	default:
+		logger.V(2).Info("CPU Manager pod hint generation skipped, operation not supported by the static CPU manager policy")
+		return nil
+	}
+}
+
+func (p *staticPolicy) getPodTopologyHintsForAdd(logger klog.Logger, s state.State, pod *v1.Pod) map[string][]topologymanager.TopologyHint {
 	logger = klog.LoggerWithValues(logger, "pod", klog.KObj(pod), "podUID", pod.UID)
 
 	// Get a count of how many guaranteed CPUs have been requested by Pod.
@@ -616,9 +923,25 @@ func (p *staticPolicy) GetPodTopologyHints(logger logr.Logger, s state.State, po
 		return nil
 	}
 
-	if utilfeature.DefaultFeatureGate.Enabled(features.PodLevelResources) && resourcehelper.IsPodLevelResourcesSet(pod) {
-		logger.V(3).Info("CPU Manager pod hint generation skipped, pod is using pod-level resources which are not supported by the static CPU manager policy")
+	// If the pod has pod-level resources but the feature gate is disabled,
+	// log it and return nil hints to admit the pod without alignment.
+	if (!utilfeature.DefaultFeatureGate.Enabled(features.PodLevelResourceManagers) || !utilfeature.DefaultFeatureGate.Enabled(features.PodLevelResources)) && resourcehelper.IsPodLevelResourcesSet(pod) {
+		logger.V(3).Info("CPU Manager pod hint generation skipped, pod is using pod-level resources but the PodLevelResourceManagers feature gate is not enabled", "podUID", pod.UID)
 		return nil
+	}
+
+	// Validate that if a pod has containers that will be placed in a shared pool,
+	// there are actually CPUs left over for that pool after accounting for all
+	// exclusive allocations. If the sum of exclusive CPU requests consumes the
+	// entire pod-level CPU budget, no hints will be generated, causing the pod
+	// to be rejected by the Topology Manager.
+	if utilfeature.DefaultFeatureGate.Enabled(features.PodLevelResourceManagers) && resourcehelper.IsPodLevelResourcesSet(pod) {
+		if err := p.validatePodScopeResources(logger, pod); err != nil {
+			logger.V(2).Info("Invalid pod spec. Sum of exclusive container requests equals pod budget, leaving no CPUs for shared containers")
+			return map[string][]topologymanager.TopologyHint{
+				string(v1.ResourceCPU): {},
+			}
+		}
 	}
 
 	assignedCPUs := cpuset.New()
@@ -646,7 +969,7 @@ func (p *staticPolicy) GetPodTopologyHints(logger logr.Logger, s state.State, po
 	if assignedCPUs.Size() == requested {
 		logger.Info("Regenerating TopologyHints for CPUs already allocated")
 		return map[string][]topologymanager.TopologyHint{
-			string(v1.ResourceCPU): p.generateCPUTopologyHints(assignedCPUs, cpuset.CPUSet{}, requested),
+			string(v1.ResourceCPU): p.generateCPUTopologyHints(assignedCPUs, cpuset.New(), requested),
 		}
 	}
 
@@ -774,7 +1097,7 @@ func (p *staticPolicy) getAlignedCPUs(numaAffinity bitmask.BitMask, allocatableC
 	return alignedCPUs
 }
 
-func (p *staticPolicy) initializeMetrics(logger logr.Logger, s state.State) {
+func (p *staticPolicy) initializeMetrics(logger klog.Logger, s state.State) {
 	metrics.CPUManagerSharedPoolSizeMilliCores.Set(float64(p.GetAvailableCPUs(s).Size() * 1000))
 	metrics.ContainerAlignedComputeResourcesFailure.WithLabelValues(metrics.AlignScopeContainer, metrics.AlignedPhysicalCPU).Add(0) // ensure the value exists
 	metrics.ContainerAlignedComputeResources.WithLabelValues(metrics.AlignScopeContainer, metrics.AlignedPhysicalCPU).Add(0)        // ensure the value exists
@@ -784,7 +1107,7 @@ func (p *staticPolicy) initializeMetrics(logger logr.Logger, s state.State) {
 	updateAllocationPerNUMAMetric(logger, p.topology, totalAssignedCPUs)
 }
 
-func (p *staticPolicy) updateMetricsOnAllocate(logger logr.Logger, s state.State, cpuAlloc topology.Allocation) {
+func (p *staticPolicy) updateMetricsOnAllocate(logger klog.Logger, s state.State, cpuAlloc topology.Allocation) {
 	ncpus := cpuAlloc.CPUs.Size()
 	metrics.CPUManagerExclusiveCPUsAllocationCount.Add(float64(ncpus))
 	metrics.CPUManagerSharedPoolSizeMilliCores.Add(float64(-ncpus * 1000))
@@ -795,7 +1118,7 @@ func (p *staticPolicy) updateMetricsOnAllocate(logger logr.Logger, s state.State
 	updateAllocationPerNUMAMetric(logger, p.topology, totalAssignedCPUs)
 }
 
-func (p *staticPolicy) updateMetricsOnRelease(logger logr.Logger, s state.State, cset cpuset.CPUSet) {
+func (p *staticPolicy) updateMetricsOnRelease(logger klog.Logger, s state.State, cset cpuset.CPUSet) {
 	ncpus := cset.Size()
 	metrics.CPUManagerExclusiveCPUsAllocationCount.Add(float64(-ncpus))
 	metrics.CPUManagerSharedPoolSizeMilliCores.Add(float64(ncpus * 1000))
@@ -813,7 +1136,7 @@ func getTotalAssignedExclusiveCPUs(s state.State) cpuset.CPUSet {
 	return totalAssignedCPUs
 }
 
-func updateAllocationPerNUMAMetric(logger logr.Logger, topo *topology.CPUTopology, allocatedCPUs cpuset.CPUSet) {
+func updateAllocationPerNUMAMetric(logger klog.Logger, topo *topology.CPUTopology, allocatedCPUs cpuset.CPUSet) {
 	numaCount := make(map[int]int)
 
 	// Count CPUs allocated per NUMA node
