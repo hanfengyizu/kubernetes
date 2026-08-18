@@ -45,16 +45,16 @@
 
 ### 1.2 核心组件
 
-| 组件 | 文件位置 | 职责 |
-|------|----------|------|
-| **GenericAPIServer** | `staging/src/k8s.io/apiserver/pkg/server/genericapiserver.go` | API Server 核心实现，管理生命周期 |
-| **APIServerHandler** | `staging/src/k8s.io/apiserver/pkg/server/handler.go` | HTTP 路由管理 |
-| **Config** | `staging/src/k8s.io/apiserver/pkg/server/config.go` | 服务器配置 |
-| **Handler Chain** | `staging/src/k8s.io/apiserver/pkg/server/config.go` | 请求处理链 |
-| **Admission Control** | `staging/src/k8s.io/apiserver/pkg/admission/interfaces.go` | 准入控制接口 |
-| **Authorizer** | `staging/src/k8s.io/apiserver/pkg/authorization/authorizer/interfaces.go` | 授权接口 |
-| **REST Storage** | `staging/src/k8s.io/apiserver/pkg/registry/rest/rest.go` | 资源存储接口 |
-| **RequestInfo** | `staging/src/k8s.io/apiserver/pkg/endpoints/request/requestinfo.go` | 请求信息解析 |
+| 组件                    | 文件位置                                                                      | 职责                     |
+| --------------------- | ------------------------------------------------------------------------- | ---------------------- |
+| **GenericAPIServer**  | `staging/src/k8s.io/apiserver/pkg/server/genericapiserver.go`             | API Server 核心实现，管理生命周期 |
+| **APIServerHandler**  | `staging/src/k8s.io/apiserver/pkg/server/handler.go`                      | HTTP 路由管理              |
+| **Config**            | `staging/src/k8s.io/apiserver/pkg/server/config.go`                       | 服务器配置                  |
+| **Handler Chain**     | `staging/src/k8s.io/apiserver/pkg/server/config.go`                       | 请求处理链                  |
+| **Admission Control** | `staging/src/k8s.io/apiserver/pkg/admission/interfaces.go`                | 准入控制接口                 |
+| **Authorizer**        | `staging/src/k8s.io/apiserver/pkg/authorization/authorizer/interfaces.go` | 授权接口                   |
+| **REST Storage**      | `staging/src/k8s.io/apiserver/pkg/registry/rest/rest.go`                  | 资源存储接口                 |
+| **RequestInfo**       | `staging/src/k8s.io/apiserver/pkg/endpoints/request/requestinfo.go`       | 请求信息解析                 |
 
 ---
 
@@ -513,16 +513,16 @@ Request → Authorizer → Decision
 
 常见准入控制器：
 
-| 准入控制器 | 功能 |
-|-----------|------|
-| `NamespaceLifecycle` | 命名空间生命周期管理 |
-| `LimitRanger` | 资源限制范围检查 |
-| `ServiceAccount` | 服务账户管理 |
-| `DefaultStorageClass` | 默认存储类 |
-| `ResourceQuota` | 资源配额检查 |
-| `PodSecurityPolicy` | Pod 安全策略 |
-| `NodeRestriction` | 节点限制 |
-| `MutatingAdmissionWebhook` | 变更 Webhook |
+| 准入控制器                        | 功能         |
+| ---------------------------- | ---------- |
+| `NamespaceLifecycle`         | 命名空间生命周期管理 |
+| `LimitRanger`                | 资源限制范围检查   |
+| `ServiceAccount`             | 服务账户管理     |
+| `DefaultStorageClass`        | 默认存储类      |
+| `ResourceQuota`              | 资源配额检查     |
+| `PodSecurityPolicy`          | Pod 安全策略   |
+| `NodeRestriction`            | 节点限制       |
+| `MutatingAdmissionWebhook`   | 变更 Webhook |
 | `ValidatingAdmissionWebhook` | 验证 Webhook |
 
 ---
@@ -659,17 +659,17 @@ type ServerRunOptions struct {
 
 ### 9.2 常用启动参数
 
-| 参数 | 说明 |
-|------|------|
-| `--etcd-servers` | Etcd 服务器地址 |
-| `--secure-port` | HTTPS 端口 |
-| `--client-ca-file` | 客户端 CA 证书 |
-| `--tls-cert-file` | TLS 证书文件 |
-| `--tls-private-key-file` | TLS 私钥文件 |
-| `--authorization-mode` | 授权模式 |
-| `--enable-admission-plugins` | 启用的准入插件 |
-| `--service-cluster-ip-range` | Service IP 范围 |
-| `--service-account-issuer` | Service Account 签发者 |
+| 参数                                   | 说明                   |
+| ------------------------------------ | -------------------- |
+| `--etcd-servers`                     | Etcd 服务器地址           |
+| `--secure-port`                      | HTTPS 端口             |
+| `--client-ca-file`                   | 客户端 CA 证书            |
+| `--tls-cert-file`                    | TLS 证书文件             |
+| `--tls-private-key-file`             | TLS 私钥文件             |
+| `--authorization-mode`               | 授权模式                 |
+| `--enable-admission-plugins`         | 启用的准入插件              |
+| `--service-cluster-ip-range`         | Service IP 范围        |
+| `--service-account-issuer`           | Service Account 签发者  |
 | `--service-account-signing-key-file` | Service Account 签名密钥 |
 
 ---
@@ -782,6 +782,7 @@ Kubernetes API Server 是一个高度模块化、可扩展的系统：
 5. **可观测性** - 完善的日志、指标、追踪支持
 
 核心设计理念：
+
 - **声明式 API** - 用户声明期望状态，系统维护实际状态
 - **Watch 机制** - 实时事件通知，减少轮询开销
 - **Finalizers** - 资源删除前的清理机制
